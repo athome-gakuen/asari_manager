@@ -10,7 +10,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 STARTUP_CHANNEL_ID = int(os.getenv("STARTUP_CHANNEL_ID"))
 SERVER_ID = int(os.getenv("SERVER_ID"))
 
-DEVELOPER_ROLE_NAME = "developer"
+DEVELOPER_ROLE_ID = int(os.getenv("DEVELOPER_ROLE_ID"))
 
 BOTS = {
     "saki": {
@@ -27,6 +27,7 @@ BOTS = {
 class AsariManager(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
+        intents.members = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -40,10 +41,12 @@ client = AsariManager()
 
 
 def has_developer_role(interaction: discord.Interaction) -> bool:
-    if not isinstance(interaction.user, discord.Member):
+    user = interaction.user
+
+    if not isinstance(user, discord.Member):
         return False
 
-    return any(role.name == DEVELOPER_ROLE_NAME for role in interaction.user.roles)
+    return any(role.id == DEVELOPER_ROLE_ID for role in user.roles)
 
 
 def run_command(command: list[str], cwd: str | None = None) -> tuple[bool, str]:
