@@ -58,6 +58,7 @@ def load_attendance_data() -> dict:
         return {
             "attendance": {},
             "daily_posts": {},
+            "daily_reports": {},
             "weekly_announcements": {},
         }
 
@@ -69,6 +70,7 @@ def load_attendance_data() -> dict:
 
     data.setdefault("attendance", {})
     data.setdefault("daily_posts", {})
+    data.setdefault("daily_reports", {})
     data.setdefault("weekly_announcements", {})
     return data
 
@@ -116,6 +118,27 @@ def build_weekly_ranking(target: date) -> tuple[str, list[tuple[str, int]]]:
     )
     period = f"{start.isoformat()} 〜 {end.isoformat()}"
     return period, ranking
+
+
+def build_daily_attendance_report(target: date) -> tuple[str, list[tuple[str, str]]]:
+    data = load_attendance_data()
+    target_date = target.isoformat()
+    day_data = data["attendance"].get(target_date, {})
+
+    attendees: list[tuple[str, str]] = []
+    for user_id, record in day_data.items():
+        name = record.get("name", f"User {user_id}")
+        attended_at = record.get("attended_at", "")
+
+        try:
+            attended_time = datetime.fromisoformat(attended_at).astimezone(JST).strftime("%H:%M")
+        except (TypeError, ValueError):
+            attended_time = "時刻不明"
+
+        attendees.append((str(name), attended_time))
+
+    attendees.sort(key=lambda item: (item[1], item[0].casefold()))
+    return target_date, attendees
 
 
 class AttendanceView(discord.ui.View):
@@ -176,6 +199,7 @@ class AsariManager(discord.Client):
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         post_daily_attendance_button.start()
+        announce_daily_attendance_report.start()
         announce_weekly_attendance_ranking.start()
 
 
@@ -196,7 +220,7 @@ async def get_attendance_channel():
     return None
 
 
-@tasks.loop(time=time(hour=8, minute=30, tzinfo=JST))
+@tasks.loop(time=time(hour=8, minute=0, tzinfo=JST))
 async def post_daily_attendance_button():
     target_date = today_jst().isoformat()
     data = load_attendance_data()
@@ -221,6 +245,44 @@ async def post_daily_attendance_button():
 
 @post_daily_attendance_button.before_loop
 async def before_post_daily_attendance_button():
+    await client.wait_until_ready()
+
+
+@tasks.loop(time=time(hour=10, minute=0, tzinfo=JST))
+async def announce_daily_attendance_report():
+    target = today_jst()
+    target_date = target.isoformat()
+    data = load_attendance_data()
+    if target_date in data["daily_reports"]:
+        return
+
+    channel = await get_attendance_channel()
+    if channel is None:
+        print(f"Attendance channel not found: {ATTENDANCE_CHANNEL_ID}")
+        return
+
+    report_date, attendees = build_daily_attendance_report(target)
+    if attendees:
+        lines = [
+            f"- {name}: {attended_time}"
+            for name, attended_time in attendees
+        ]
+        body = "\n".join(lines)
+    else:
+        body = "今日10時時点の登校記録はありません。"
+
+    await channel.send(
+        f"{report_date} の登校状況をお知らせします。\n"
+        f"{body}"
+    )
+
+    data = load_attendance_data()
+    data["daily_reports"][target_date] = now_jst().isoformat()
+    save_attendance_data(data)
+
+
+@announce_daily_attendance_report.before_loop
+async def before_announce_daily_attendance_report():
     await client.wait_until_ready()
 
 
