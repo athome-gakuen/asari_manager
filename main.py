@@ -16,7 +16,7 @@ STARTUP_CHANNEL_ID = int(os.getenv("STARTUP_CHANNEL_ID"))
 SERVER_ID = int(os.getenv("SERVER_ID"))
 
 DEVELOPER_ROLE_ID = int(os.getenv("DEVELOPER_ROLE_ID"))
-ATTENDANCE_CHANNEL_ID = int(os.getenv("ATTENDANCE_CHANNEL_ID", STARTUP_CHANNEL_ID))
+ATTENDANCE_CHANNEL_ID = int(os.getenv("ATTENDANCE_CHANNEL_ID"))
 JST = timezone(timedelta(hours=9))
 ATTENDANCE_FILE = Path(__file__).with_name("attendance.json")
 
@@ -196,7 +196,7 @@ async def get_attendance_channel():
     return None
 
 
-@tasks.loop(time=time(hour=8, minute=0, tzinfo=JST))
+@tasks.loop(time=time(hour=8, minute=30, tzinfo=JST))
 async def post_daily_attendance_button():
     target_date = today_jst().isoformat()
     data = load_attendance_data()
