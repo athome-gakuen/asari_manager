@@ -4,6 +4,7 @@ import subprocess
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 import discord
+import yaml
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
@@ -19,16 +20,29 @@ ATTENDANCE_CHANNEL_ID = int(os.getenv("ATTENDANCE_CHANNEL_ID", STARTUP_CHANNEL_I
 JST = timezone(timedelta(hours=9))
 ATTENDANCE_FILE = Path(__file__).with_name("attendance.json")
 
-BOTS = {
-    "saki": {
-        "path": "/home/st/discord/saki",
-        "service": "saki.service",
-    },
-    "hiro": {
-        "path": "/home/st/discord/hiro",
-        "service": "hiro.service",
-    },
-}
+BASE_DIR = Path(__file__).resolve().parent
+BOTS_FILE = BASE_DIR / "bots.yml"
+
+
+def load_bots() -> dict:
+    if not BOTS_FILE.exists():
+        return {}
+
+    try:
+        with BOTS_FILE.open("r", encoding="utf-8") as file:
+            data = yaml.safe_load(file)
+    except (OSError, yaml.YAMLError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    bots = data.get("bots", {})
+
+    if not isinstance(bots, dict):
+        return {}
+
+    return bots
 
 
 def today_jst() -> date:
@@ -293,17 +307,30 @@ async def on_ready():
         await channel.send("起動しました")
 
 
+async def bot_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    bots = load_bots()
+    bot_names = sorted(bots.keys())
+
+    matched = [
+        name for name in bot_names
+        if current.lower() in name.lower()
+    ]
+
+    return [
+        app_commands.Choice(name=name, value=name)
+        for name in matched[:25]
+    ]
+
+
 @client.tree.command(name="deploy", description="指定したBotを更新して再起動します")
 @app_commands.describe(bot="デプロイするBotを選択してください")
-@app_commands.choices(
-    bot=[
-        app_commands.Choice(name="saki", value="saki"),
-        app_commands.Choice(name="hiro", value="hiro"),
-    ]
-)
+@app_commands.autocomplete(bot=bot_autocomplete)
 async def deploy(
     interaction: discord.Interaction,
-    bot: app_commands.Choice[str],
+    bot: str,
 ):
     await interaction.response.defer(thinking=True)
 
@@ -314,8 +341,24 @@ async def deploy(
         )
         return
 
-    bot_name = bot.value
-    target = BOTS[bot_name]
+    bots = load_bots()
+
+    if bot not in bots:
+        await interaction.followup.send(
+            f"`{bot}` は登録されていないBotです。",
+            ephemeral=True,
+        )
+        return
+
+    bot_name = bot
+    target = bots[bot_name]
+
+    if "path" not in target or "service" not in target:
+        await interaction.followup.send(
+            f"`{bot_name}` の設定が不正です。`path` と `service` を確認してください。",
+            ephemeral=True,
+        )
+        return
 
     await interaction.followup.send(f"`{bot_name}` のデプロイを開始します。")
 

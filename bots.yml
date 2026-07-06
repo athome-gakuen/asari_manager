@@ -1,0 +1,28 @@
+bots:
+  hiro:
+    path: /home/st/discord/hiro
+    service: hiro.service
+
+  lilja:
+    path: /home/st/discord/lilja
+    service: lilja.service
+
+  mao:
+    path: /home/st/discord/mao
+    service: mao.service
+
+  misuzu:
+    path: /home/st/discord/misuzu
+    service: misuzu.service
+
+  saki:
+    path: /home/st/discord/saki
+    service: saki.service
+
+  sumika:
+    path: /home/st/discord/sumika
+    service: sumika.service
+
+  temari:
+    path: /home/st/discord/temari
+    service: temari.service
