@@ -25,6 +25,7 @@ BASE_DIR = Path(__file__).resolve().parent
 BOTS_FILE = BASE_DIR / "bots.yml"
 SYSTEMCTL = "/bin/systemctl"
 JOURNALCTL = "/bin/journalctl"
+ASARI_MANAGER_SERVICE = "asari_manager.service"
 
 
 def load_bots() -> dict:
@@ -386,6 +387,12 @@ def trim_output(output: str, limit: int = 1500) -> str:
     return output[-limit:]
 
 
+def trim_output_head(output: str, limit: int = 1500) -> str:
+    if len(output) <= limit:
+        return output
+    return output[:limit] + "\n..."
+
+
 def code_block(output: str, limit: int = 1500) -> str:
     safe_output = trim_output(output or "出力はありません。", limit).replace("```", "'''")
     return f"```text\n{safe_output}\n```"
@@ -465,7 +472,7 @@ def format_status_line(bot_name: str, status: dict[str, object]) -> str:
 
 
 def format_status_detail(bot_name: str, status: dict[str, object]) -> str:
-    status_output = trim_output(str(status["status_output"]), 700)
+    status_output = trim_output_head(str(status["status_output"]), 700)
     logs_output = trim_output(str(status.get("logs_output") or ""), 700)
     lines = [
         format_status_line(bot_name, status),
@@ -593,6 +600,65 @@ async def deploy(
             f"{bot_name} さんのレッスンが終わりました。\n"
             "状態：起動に失敗している可能性があります。\n"
             f"{code_block(format_status_detail(bot_name, status), 1800)}"
+        )
+
+
+@client.tree.command(name="reboot", description="asari_managerを更新して再起動します")
+async def reboot(
+    interaction: discord.Interaction,
+):
+    await interaction.response.defer(thinking=True)
+
+    if not has_developer_role(interaction):
+        await interaction.followup.send(
+            "このコマンドは developer ロールを持っている人だけ実行できます。",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send("あさり先生の再起動準備を行います。")
+
+    base_dir = str(BASE_DIR)
+    ok, output = run_command(
+        ["git", "fetch", "origin"],
+        cwd=base_dir,
+    )
+    if not ok:
+        await interaction.followup.send(
+            f"あさり先生の `git fetch` に失敗しました。\n{code_block(output)}"
+        )
+        return
+
+    ok, output = run_command(
+        ["git", "reset", "--hard", "origin/main"],
+        cwd=base_dir,
+    )
+    if not ok:
+        await interaction.followup.send(
+            f"あさり先生の `git reset` に失敗しました。\n{code_block(output)}"
+        )
+        return
+
+    ok, output = run_command(
+        [f"{base_dir}/.venv/bin/pip", "install", "-r", "requirements.txt"],
+        cwd=base_dir,
+    )
+    if not ok:
+        await interaction.followup.send(
+            f"あさり先生のライブラリ更新に失敗しました。\n{code_block(output)}"
+        )
+        return
+
+    await interaction.followup.send(
+        "あさり先生の更新が終わりました。これから再起動します。"
+    )
+
+    ok, output = run_command(
+        ["sudo", "-n", SYSTEMCTL, "restart", ASARI_MANAGER_SERVICE],
+    )
+    if not ok:
+        await interaction.followup.send(
+            f"あさり先生の再起動に失敗しました。\n{code_block(output)}"
         )
 
 
