@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 import subprocess
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -141,12 +142,30 @@ def build_daily_attendance_report(target: date) -> tuple[str, list[tuple[str, st
     return target_date, attendees
 
 
+def build_previous_attendance_summary(target: date) -> str:
+    report_date, attendees = build_daily_attendance_report(target)
+    top_attendees = attendees[:5]
+
+    if not top_attendees:
+        return f"昨日（{report_date}）は登校した人はいませんでした。"
+
+    lines = [
+        f"{index}. {name} さん（{attended_time}）"
+        for index, (name, attended_time) in enumerate(top_attendees, start=1)
+    ]
+    return (
+        f"昨日（{report_date}）は以下の方が初星学園へ登校していました。\n"
+        f"{chr(10).join(lines)}\n"
+        "引き続きプロデュース頑張ってください。"
+    )
+
+
 class AttendanceView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="登校",
+        label="初星学園へ登校",
         style=discord.ButtonStyle.primary,
         custom_id="asari_manager:attendance:check_in",
     )
@@ -158,7 +177,7 @@ class AttendanceView(discord.ui.View):
         user = interaction.user
         if user.bot:
             await interaction.response.send_message(
-                "Botは登校記録の対象外です。",
+                "Botは初星学園への登校記録の対象外です。",
                 ephemeral=True,
             )
             return
@@ -170,7 +189,7 @@ class AttendanceView(discord.ui.View):
 
         if user_id in day_data:
             await interaction.response.send_message(
-                f"{target_date} の登校は記録済みです。",
+                f"{target_date} の初星学園への登校は記録済みです。",
                 ephemeral=True,
             )
             return
@@ -182,7 +201,7 @@ class AttendanceView(discord.ui.View):
         save_attendance_data(data)
 
         await interaction.response.send_message(
-            f"{user.display_name} さんの登校を記録しました。",
+            f"{user.display_name} さんの初星学園への登校を記録しました。",
             ephemeral=True,
         )
 
@@ -199,7 +218,6 @@ class AsariManager(discord.Client):
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         post_daily_attendance_button.start()
-        announce_daily_attendance_report.start()
         announce_weekly_attendance_ranking.start()
 
 
@@ -233,8 +251,8 @@ async def post_daily_attendance_button():
         return
 
     message = await channel.send(
-        f"おはようございます。{target_date} の登校確認です。\n"
-        "登校した人は下の「登校」ボタンを押してください。",
+        "おはようございます。今日もプロデュース頑張ってくださいね。\n\n"
+        f"{build_previous_attendance_summary(today_jst() - timedelta(days=1))}",
         view=AttendanceView(),
     )
 
@@ -360,6 +378,102 @@ def run_command(command: list[str], cwd: str | None = None) -> tuple[bool, str]:
         return False, "コマンドがタイムアウトしました。"
 
 
+def trim_output(output: str, limit: int = 1500) -> str:
+    if len(output) <= limit:
+        return output
+    return output[-limit:]
+
+
+def code_block(output: str, limit: int = 1500) -> str:
+    safe_output = trim_output(output or "出力はありません。", limit).replace("```", "'''")
+    return f"```text\n{safe_output}\n```"
+
+
+def parse_systemctl_show(output: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key] = value
+    return values
+
+
+def get_bot_service_status(service: str, include_logs: bool = False) -> dict[str, object]:
+    show_ok, show_output = run_command(
+        [
+            "sudo",
+            "systemctl",
+            "show",
+            service,
+            "-p",
+            "ActiveState",
+            "-p",
+            "SubState",
+            "-p",
+            "Result",
+            "-p",
+            "ExecMainStatus",
+            "-p",
+            "NRestarts",
+            "--no-pager",
+        ],
+    )
+    values = parse_systemctl_show(show_output)
+    active_state = values.get("ActiveState", "unknown")
+    sub_state = values.get("SubState", "unknown")
+    result = values.get("Result", "unknown")
+    exec_main_status = values.get("ExecMainStatus", "unknown")
+    restart_count = values.get("NRestarts", "unknown")
+    is_running = show_ok and active_state == "active" and sub_state == "running" and result in ("success", "")
+
+    status_ok, status_output = run_command(
+        ["sudo", "systemctl", "status", service, "--no-pager"],
+    )
+
+    logs_output = ""
+    if include_logs:
+        _, logs_output = run_command(
+            ["sudo", "journalctl", "-u", service, "-n", "40", "--no-pager"],
+        )
+
+    return {
+        "is_running": is_running,
+        "active_state": active_state,
+        "sub_state": sub_state,
+        "result": result,
+        "exec_main_status": exec_main_status,
+        "restart_count": restart_count,
+        "show_ok": show_ok,
+        "show_output": show_output,
+        "status_ok": status_ok,
+        "status_output": status_output,
+        "logs_output": logs_output,
+    }
+
+
+def format_status_line(bot_name: str, status: dict[str, object]) -> str:
+    marker = "OK" if status["is_running"] else "NG"
+    return (
+        f"{marker} `{bot_name}`: "
+        f"{status['active_state']} / {status['sub_state']} "
+        f"(result={status['result']}, code={status['exec_main_status']}, restarts={status['restart_count']})"
+    )
+
+
+def format_status_detail(bot_name: str, status: dict[str, object]) -> str:
+    lines = [
+        format_status_line(bot_name, status),
+        "",
+        "状態:",
+        str(status["status_output"]),
+    ]
+    logs_output = str(status.get("logs_output") or "")
+    if logs_output:
+        lines.extend(["", "直近ログ:", logs_output])
+    return "\n".join(lines)
+
+
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
@@ -422,7 +536,7 @@ async def deploy(
         )
         return
 
-    await interaction.followup.send(f"`{bot_name}` のデプロイを開始します。")
+    await interaction.followup.send(f"{bot_name} さんのレッスンを行います。")
 
     ok, output = run_command(
         ["git", "fetch", "origin"],
@@ -430,7 +544,7 @@ async def deploy(
     )
     if not ok:
         await interaction.followup.send(
-            f"`{bot_name}` の `git fetch` に失敗しました。\n```text\n{output[-1500:]}\n```"
+            f"{bot_name} さんのレッスン中に `git fetch` で失敗しました。\n{code_block(output)}"
         )
         return
 
@@ -440,7 +554,7 @@ async def deploy(
     )
     if not ok:
         await interaction.followup.send(
-            f"`{bot_name}` の `git reset` に失敗しました。\n```text\n{output[-1500:]}\n```"
+            f"{bot_name} さんのレッスン中に `git reset` で失敗しました。\n{code_block(output)}"
         )
         return
 
@@ -450,7 +564,7 @@ async def deploy(
     )
     if not ok:
         await interaction.followup.send(
-            f"`{bot_name}` のライブラリ更新に失敗しました。\n```text\n{output[-1500:]}\n```"
+            f"{bot_name} さんのライブラリ更新に失敗しました。\n{code_block(output)}"
         )
         return
 
@@ -459,22 +573,74 @@ async def deploy(
     )
     if not ok:
         await interaction.followup.send(
-            f"`{bot_name}` の再起動に失敗しました。\n```text\n{output[-1500:]}\n```"
+            f"{bot_name} さんの再起動に失敗しました。\n{code_block(output)}"
         )
         return
 
-    ok, output = run_command(
-        ["sudo", "systemctl", "is-active", target["service"]],
-    )
+    await asyncio.sleep(8)
+    status = get_bot_service_status(target["service"], include_logs=True)
 
-    if ok and output.strip() == "active":
+    if status["is_running"]:
         await interaction.followup.send(
-            f"`{bot_name}` のデプロイが完了しました。状態: `active`"
+            f"{bot_name} さんのレッスンが終わりました。\n状態：`active / running`"
         )
     else:
         await interaction.followup.send(
-            f"`{bot_name}` は再起動しましたが、状態確認に失敗しました。\n```text\n{output[-1500:]}\n```"
+            f"{bot_name} さんのレッスンが終わりました。\n"
+            "状態：起動に失敗している可能性があります。\n"
+            f"{code_block(format_status_detail(bot_name, status), 1800)}"
         )
+
+
+@client.tree.command(name="checkbot", description="Botのsystemdステータスを確認します")
+@app_commands.describe(bot="確認するBotを選択してください。未指定の場合は全Botを確認します")
+@app_commands.autocomplete(bot=bot_autocomplete)
+async def checkbot(
+    interaction: discord.Interaction,
+    bot: str | None = None,
+):
+    await interaction.response.defer(thinking=True)
+
+    if not has_developer_role(interaction):
+        await interaction.followup.send(
+            "このコマンドは developer ロールを持っている人だけ実行できます。",
+            ephemeral=True,
+        )
+        return
+
+    bots = load_bots()
+    if bot is not None and bot not in bots:
+        await interaction.followup.send(
+            f"`{bot}` は登録されていないBotです。",
+            ephemeral=True,
+        )
+        return
+
+    if bot is None:
+        lines = []
+        for bot_name, target in sorted(bots.items()):
+            if "service" not in target:
+                lines.append(f"NG `{bot_name}`: service が設定されていません")
+                continue
+            status = get_bot_service_status(target["service"])
+            lines.append(format_status_line(bot_name, status))
+
+        await interaction.followup.send("Botの状態です。\n" + "\n".join(lines))
+        return
+
+    target = bots[bot]
+    if "service" not in target:
+        await interaction.followup.send(
+            f"`{bot}` の設定が不正です。`service` を確認してください。",
+            ephemeral=True,
+        )
+        return
+
+    status = get_bot_service_status(target["service"], include_logs=True)
+    await interaction.followup.send(
+        f"{bot} さんの状態です。\n{code_block(format_status_detail(bot, status), 1800)}"
+    )
+
 
 @client.tree.error
 async def on_app_command_error(
