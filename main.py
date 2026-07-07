@@ -23,6 +23,8 @@ ATTENDANCE_FILE = Path(__file__).with_name("attendance.json")
 
 BASE_DIR = Path(__file__).resolve().parent
 BOTS_FILE = BASE_DIR / "bots.yml"
+SYSTEMCTL = "/bin/systemctl"
+JOURNALCTL = "/bin/journalctl"
 
 
 def load_bots() -> dict:
@@ -404,7 +406,7 @@ def get_bot_service_status(service: str, include_logs: bool = False) -> dict[str
         [
             "sudo",
             "-n",
-            "systemctl",
+            SYSTEMCTL,
             "show",
             service,
             "-p",
@@ -429,13 +431,13 @@ def get_bot_service_status(service: str, include_logs: bool = False) -> dict[str
     is_running = show_ok and active_state == "active" and sub_state == "running" and result in ("success", "")
 
     status_ok, status_output = run_command(
-        ["sudo", "-n", "systemctl", "status", service, "--no-pager"],
+        ["sudo", "-n", SYSTEMCTL, "status", service, "--no-pager"],
     )
 
     logs_output = ""
     if include_logs:
         _, logs_output = run_command(
-            ["sudo", "-n", "journalctl", "-u", service, "-n", "40", "--no-pager"],
+            ["sudo", "-n", JOURNALCTL, "-u", service, "-n", "40", "--no-pager"],
         )
 
     return {
@@ -463,13 +465,14 @@ def format_status_line(bot_name: str, status: dict[str, object]) -> str:
 
 
 def format_status_detail(bot_name: str, status: dict[str, object]) -> str:
+    status_output = trim_output(str(status["status_output"]), 700)
+    logs_output = trim_output(str(status.get("logs_output") or ""), 700)
     lines = [
         format_status_line(bot_name, status),
         "",
         "状態:",
-        str(status["status_output"]),
+        status_output,
     ]
-    logs_output = str(status.get("logs_output") or "")
     if logs_output:
         lines.extend(["", "直近ログ:", logs_output])
     return "\n".join(lines)
@@ -570,7 +573,7 @@ async def deploy(
         return
 
     ok, output = run_command(
-        ["sudo", "-n", "systemctl", "restart", target["service"]],
+        ["sudo", "-n", SYSTEMCTL, "restart", target["service"]],
     )
     if not ok:
         await interaction.followup.send(
