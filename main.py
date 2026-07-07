@@ -403,6 +403,7 @@ def get_bot_service_status(service: str, include_logs: bool = False) -> dict[str
     show_ok, show_output = run_command(
         [
             "sudo",
+            "-n",
             "systemctl",
             "show",
             service,
@@ -428,13 +429,13 @@ def get_bot_service_status(service: str, include_logs: bool = False) -> dict[str
     is_running = show_ok and active_state == "active" and sub_state == "running" and result in ("success", "")
 
     status_ok, status_output = run_command(
-        ["sudo", "systemctl", "status", service, "--no-pager"],
+        ["sudo", "-n", "systemctl", "status", service, "--no-pager"],
     )
 
     logs_output = ""
     if include_logs:
         _, logs_output = run_command(
-            ["sudo", "journalctl", "-u", service, "-n", "40", "--no-pager"],
+            ["sudo", "-n", "journalctl", "-u", service, "-n", "40", "--no-pager"],
         )
 
     return {
@@ -569,7 +570,7 @@ async def deploy(
         return
 
     ok, output = run_command(
-        ["sudo", "systemctl", "restart", target["service"]],
+        ["sudo", "-n", "systemctl", "restart", target["service"]],
     )
     if not ok:
         await interaction.followup.send(
