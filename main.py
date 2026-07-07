@@ -181,6 +181,13 @@ def build_event_embed(event_id: str, event: dict) -> discord.Embed:
         value=str(event.get("location", "未設定")),
         inline=False,
     )
+    location_url = str(event.get("location_url", "")).strip()
+    if location_url:
+        embed.add_field(
+            name="場所リンク",
+            value=location_url,
+            inline=False,
+        )
     embed.add_field(
         name="予算",
         value=str(event.get("budget", "未設定")),
@@ -904,6 +911,7 @@ async def reboot(
     start_at="開始日時 例: 2026-07-20 20:00",
     end_at="終了予定 例: 2026-07-20 22:00",
     signup_deadline="募集締切 例: 2026-07-18 23:59",
+    location_url="場所のリンク",
     note="備考",
 )
 async def event(
@@ -916,6 +924,7 @@ async def event(
     start_at: str,
     end_at: str,
     signup_deadline: str,
+    location_url: str | None = None,
     note: str | None = None,
 ):
     await interaction.response.defer(thinking=True)
@@ -965,6 +974,7 @@ async def event(
         "title": title,
         "organizer": organizer,
         "location": location,
+        "location_url": location_url or "",
         "budget": budget,
         "capacity": capacity,
         "start_at": parsed_start_at.isoformat(),
