@@ -58,6 +58,24 @@ def now_jst() -> datetime:
     return datetime.now(JST)
 
 
+ATTENDANCE_CLOSE_TIME = time(hour=23, minute=59, tzinfo=JST)
+
+def attendance_closed(target: datetime | None = None) -> bool:
+    current = target or now_jst()
+    return current.timetz() >= ATTENDANCE_CLOSE_TIME
+
+
+def find_attendance_post_date(data: dict, message_id: int | None) -> str | None:
+    if message_id is None:
+        return None
+
+    for post_date, stored_message_id in data["daily_posts"].items():
+        if str(stored_message_id) == str(message_id):
+            return str(post_date)
+
+    return None
+
+
 def load_attendance_data() -> dict:
     if not ATTENDANCE_FILE.exists():
         return {
@@ -290,8 +308,11 @@ def build_previous_attendance_summary(target: date) -> str:
 
 
 class AttendanceView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, disabled: bool = False):
         super().__init__(timeout=None)
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = disabled
 
     @discord.ui.button(
         label="初星学園へ登校",
@@ -314,6 +335,18 @@ class AttendanceView(discord.ui.View):
         target_date = today_jst().isoformat()
         user_id = str(user.id)
         data = load_attendance_data()
+        message_date = find_attendance_post_date(
+            data,
+            interaction.message.id if interaction.message is not None else None,
+        )
+
+        if message_date != target_date or attendance_closed():
+            await interaction.response.send_message(
+                "Today's attendance button is closed.",
+                ephemeral=True,
+            )
+            return
+
         day_data = data["attendance"].setdefault(target_date, {})
 
         if user_id in day_data:
@@ -460,6 +493,7 @@ class AsariManager(discord.Client):
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         post_daily_attendance_button.start()
+        disable_daily_attendance_button.start()
         announce_weekly_attendance_ranking.start()
 
 
@@ -505,6 +539,31 @@ async def post_daily_attendance_button():
 
 @post_daily_attendance_button.before_loop
 async def before_post_daily_attendance_button():
+    await client.wait_until_ready()
+
+
+@tasks.loop(time=ATTENDANCE_CLOSE_TIME)
+async def disable_daily_attendance_button():
+    target_date = today_jst().isoformat()
+    data = load_attendance_data()
+    message_id = data["daily_posts"].get(target_date)
+    if message_id is None:
+        return
+
+    channel = await get_attendance_channel()
+    if channel is None:
+        print(f"Attendance channel not found: {ATTENDANCE_CHANNEL_ID}")
+        return
+
+    try:
+        message = await channel.fetch_message(int(message_id))
+        await message.edit(view=AttendanceView(disabled=True))
+    except (discord.DiscordException, ValueError) as error:
+        print(f"Failed to disable attendance button: {error}")
+
+
+@disable_daily_attendance_button.before_loop
+async def before_disable_daily_attendance_button():
     await client.wait_until_ready()
 
 
