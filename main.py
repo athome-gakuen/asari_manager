@@ -1158,13 +1158,6 @@ async def mktimes(
 ):
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    if not has_developer_role(interaction):
-        await interaction.followup.send(
-            "このコマンドは developer ロールを持っている人だけ実行できます。",
-            ephemeral=True,
-        )
-        return
-
     guild = interaction.guild
     if guild is None:
         await interaction.followup.send(
