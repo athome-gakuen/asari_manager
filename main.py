@@ -12,17 +12,42 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-STARTUP_CHANNEL_ID = int(os.getenv("STARTUP_CHANNEL_ID"))
-SERVER_ID = int(os.getenv("SERVER_ID"))
+BASE_DIR = Path(__file__).resolve().parent
 
-DEVELOPER_ROLE_ID = int(os.getenv("DEVELOPER_ROLE_ID"))
-ATTENDANCE_CHANNEL_ID = int(os.getenv("ATTENDANCE_CHANNEL_ID"))
+
+def load_discord_ids(bot_name: str) -> dict[str, int]:
+    config_path = BASE_DIR.parent / "discord_ids.yml"
+
+    with config_path.open("r", encoding="utf-8") as file:
+        data = yaml.safe_load(file) or {}
+
+    bot_config = data.get("bots", {}).get(bot_name)
+    if not isinstance(bot_config, dict):
+        raise RuntimeError(f"Missing bots.{bot_name} in {config_path}")
+
+    resolved: dict[str, int] = {}
+    for key, ref in bot_config.items():
+        value = ref
+        if isinstance(ref, str) and not ref.isdigit():
+            value = data
+            for part in ref.split("."):
+                value = value[part]
+        resolved[key] = int(value)
+
+    return resolved
+
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+CONFIG = load_discord_ids("asari_manager")
+STARTUP_CHANNEL_ID = CONFIG["STARTUP_CHANNEL_ID"]
+SERVER_ID = CONFIG["SERVER_ID"]
+DEVELOPER_ROLE_ID = CONFIG["DEVELOPER_ROLE_ID"]
+ATTENDANCE_CHANNEL_ID = CONFIG["ATTENDANCE_CHANNEL_ID"]
+TIMES_CATEGORY_ID = CONFIG["TIMES_CATEGORY_ID"]
 JST = timezone(timedelta(hours=9))
 ATTENDANCE_FILE = Path(__file__).with_name("attendance.json")
 EVENTS_FILE = Path(__file__).with_name("events.json")
 
-BASE_DIR = Path(__file__).resolve().parent
 BOTS_FILE = BASE_DIR / "bots.yml"
 SYSTEMCTL = "/bin/systemctl"
 JOURNALCTL = "/bin/journalctl"
@@ -656,6 +681,21 @@ def has_developer_role(interaction: discord.Interaction) -> bool:
     return any(role.id == DEVELOPER_ROLE_ID for role in user.roles)
 
 
+def normalize_times_name(name: str) -> str:
+    cleaned = name.strip().lower()
+    cleaned = "".join(
+        character if character.isalnum() or character in ("-", "_") else "-"
+        for character in cleaned
+    )
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    cleaned = cleaned.strip("_-")
+
+    if cleaned.endswith("_times"):
+        return cleaned
+
+    return f"{cleaned}_times"
+
+
 def run_command(command: list[str], cwd: str | None = None) -> tuple[bool, str]:
     try:
         result = subprocess.run(
@@ -1107,6 +1147,84 @@ async def checkbot(
     status = get_bot_service_status(target["service"], include_logs=True)
     await interaction.followup.send(
         f"{bot} さんの状態です。\n{code_block(format_status_detail(bot, status), 1800)}"
+    )
+
+
+@client.tree.command(name="mktimes", description="timesカテゴリにtimesフォーラムを作成します")
+@app_commands.describe(name="作成するtimes名。例: lilja -> lilja_times")
+async def mktimes(
+    interaction: discord.Interaction,
+    name: str,
+):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    if not has_developer_role(interaction):
+        await interaction.followup.send(
+            "このコマンドは developer ロールを持っている人だけ実行できます。",
+            ephemeral=True,
+        )
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send(
+            "サーバー内で実行してください。",
+            ephemeral=True,
+        )
+        return
+
+    forum_name = normalize_times_name(name)
+    if forum_name == "_times" or len(forum_name) > 100:
+        await interaction.followup.send(
+            "名前は1文字以上、`_times` を付けた状態で100文字以内にしてください。",
+            ephemeral=True,
+        )
+        return
+
+    times_category = guild.get_channel(TIMES_CATEGORY_ID)
+    if times_category is None:
+        try:
+            times_category = await client.fetch_channel(TIMES_CATEGORY_ID)
+        except discord.DiscordException:
+            times_category = None
+
+    if not isinstance(times_category, discord.CategoryChannel):
+        await interaction.followup.send(
+            "`TIMES_CATEGORY_ID` のカテゴリが見つかりませんでした。",
+            ephemeral=True,
+        )
+        return
+
+    for channel in times_category.channels:
+        if channel.name.casefold() == forum_name.casefold():
+            await interaction.followup.send(
+                f"`{forum_name}` は既に存在します。",
+                ephemeral=True,
+            )
+            return
+
+    try:
+        forum = await guild.create_forum(
+            name=forum_name,
+            category=times_category,
+            reason=f"Created by /mktimes for {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "フォーラムを作成する権限がありません。Botにチャンネル管理権限を付けてください。",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as error:
+        await interaction.followup.send(
+            f"フォーラムの作成に失敗しました。\n{code_block(str(error))}",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        f"`{forum.name}` を作成しました: {forum.mention}",
+        ephemeral=True,
     )
 
 
