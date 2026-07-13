@@ -1,7 +1,9 @@
 import os
 import json
 import asyncio
+import ipaddress
 import subprocess
+import urllib.request
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 import discord
@@ -823,6 +825,17 @@ def format_status_detail(bot_name: str, status: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def get_global_ip() -> str:
+    request = urllib.request.Request(
+        "https://api.ipify.org",
+        headers={"User-Agent": "asari-manager/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        global_ip = response.read().decode("ascii").strip()
+
+    return str(ipaddress.ip_address(global_ip))
+
+
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
@@ -830,6 +843,25 @@ async def on_ready():
     channel = client.get_channel(STARTUP_CHANNEL_ID)
     if channel is not None:
         await channel.send("起動しました")
+
+
+@client.tree.command(name="ip", description="BotサーバーのグローバルIPアドレスを表示します")
+async def ip(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        global_ip = await asyncio.to_thread(get_global_ip)
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"Failed to get global IP address: {error}")
+        await interaction.followup.send(
+            "グローバルIPアドレスを取得できませんでした。しばらくしてから再試行してください。",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        f"このBotサーバーのグローバルIPアドレスは `{global_ip}` です。"
+    )
 
 
 async def bot_autocomplete(
