@@ -50,6 +50,13 @@ JST = timezone(timedelta(hours=9))
 ATTENDANCE_FILE = Path(__file__).with_name("attendance.json")
 EVENTS_FILE = Path(__file__).with_name("events.json")
 
+GAKUMAS_IOS_URL = "https://apps.apple.com/jp/app/id6446659989"
+GAKUMAS_ANDROID_URL = (
+    "https://play.google.com/store/apps/details"
+    "?id=com.bandainamcoent.idolmaster_gakuen"
+)
+GAKUMAS_PC_URL = "https://dmg-gakuen.idolmaster-official.jp/"
+
 BOTS_FILE = BASE_DIR / "bots.yml"
 SYSTEMCTL = "/bin/systemctl"
 JOURNALCTL = "/bin/journalctl"
@@ -334,6 +341,32 @@ def build_previous_attendance_summary(target: date) -> str:
     )
 
 
+class AttendanceLaunchView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(
+            discord.ui.Button(
+                label="iPhone版を開く",
+                style=discord.ButtonStyle.link,
+                url=GAKUMAS_IOS_URL,
+            )
+        )
+        self.add_item(
+            discord.ui.Button(
+                label="Android版を開く",
+                style=discord.ButtonStyle.link,
+                url=GAKUMAS_ANDROID_URL,
+            )
+        )
+        self.add_item(
+            discord.ui.Button(
+                label="PC（DMM）版を開く",
+                style=discord.ButtonStyle.link,
+                url=GAKUMAS_PC_URL,
+            )
+        )
+
+
 class AttendanceView(discord.ui.View):
     def __init__(self, disabled: bool = False):
         super().__init__(timeout=None)
@@ -342,7 +375,7 @@ class AttendanceView(discord.ui.View):
                 item.disabled = disabled
 
     @discord.ui.button(
-        label="初星学園へ登校",
+        label="初星学園へ登校する",
         style=discord.ButtonStyle.primary,
         custom_id="asari_manager:attendance:check_in",
     )
@@ -378,8 +411,10 @@ class AttendanceView(discord.ui.View):
 
         if user_id in day_data:
             await interaction.response.send_message(
-                f"{target_date} の初星学園への登校は記録済みです。",
+                f"{target_date} の初星学園への登校は記録済みです。\n"
+                "遊ぶ端末を選んで学マスを開いてください。",
                 ephemeral=True,
+                view=AttendanceLaunchView(),
             )
             return
 
@@ -390,8 +425,10 @@ class AttendanceView(discord.ui.View):
         save_attendance_data(data)
 
         await interaction.response.send_message(
-            f"{user.display_name} さんの初星学園への登校を記録しました。",
+            f"{user.display_name} さんの初星学園への登校を記録しました。\n"
+            "遊ぶ端末を選んで学マスを開いてください。",
             ephemeral=True,
+            view=AttendanceLaunchView(),
         )
 
 
