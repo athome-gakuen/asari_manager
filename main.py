@@ -302,12 +302,14 @@ def build_weekly_ranking(target: date) -> tuple[str, list[tuple[str, int]]]:
     return period, ranking
 
 
-def build_daily_attendance_report(target: date) -> tuple[str, list[tuple[str, str]]]:
+def build_daily_attendance_report(
+    target: date,
+) -> tuple[str, list[tuple[str, str, str]]]:
     data = load_attendance_data()
     target_date = target.isoformat()
     day_data = data["attendance"].get(target_date, {})
 
-    attendees: list[tuple[str, str]] = []
+    attendees: list[tuple[str, str, str]] = []
     for user_id, record in day_data.items():
         name = record.get("name", f"User {user_id}")
         attended_at = record.get("attended_at", "")
@@ -317,9 +319,9 @@ def build_daily_attendance_report(target: date) -> tuple[str, list[tuple[str, st
         except (TypeError, ValueError):
             attended_time = "時刻不明"
 
-        attendees.append((str(name), attended_time))
+        attendees.append((str(user_id), str(name), attended_time))
 
-    attendees.sort(key=lambda item: (item[1], item[0].casefold()))
+    attendees.sort(key=lambda item: (item[2], item[1].casefold()))
     return target_date, attendees
 
 
@@ -331,13 +333,12 @@ def build_previous_attendance_summary(target: date) -> str:
         return f"昨日（{report_date}）は登校した人はいませんでした。"
 
     lines = [
-        f"{index}. {name} さん（{attended_time}）"
-        for index, (name, attended_time) in enumerate(top_attendees, start=1)
+        f"{index}位：<@{user_id}>（{attended_time}）"
+        for index, (user_id, _name, attended_time) in enumerate(top_attendees, start=1)
     ]
     return (
         f"昨日（{report_date}）は以下の方が初星学園へ登校していました。\n"
-        f"{chr(10).join(lines)}\n"
-        "引き続きプロデュース頑張ってください。"
+        f"{chr(10).join(lines)}"
     )
 
 
@@ -412,7 +413,7 @@ class AttendanceView(discord.ui.View):
         if user_id in day_data:
             await interaction.response.send_message(
                 f"{target_date} の初星学園への登校は記録済みです。\n"
-                "遊ぶ端末を選んで学マスを開いてください。",
+                "アイドルたちが待っています。プロデュース頑張ってくださいね。",
                 ephemeral=True,
                 view=AttendanceLaunchView(),
             )
@@ -425,8 +426,8 @@ class AttendanceView(discord.ui.View):
         save_attendance_data(data)
 
         await interaction.response.send_message(
-            f"{user.display_name} さんの初星学園への登校を記録しました。\n"
-            "遊ぶ端末を選んで学マスを開いてください。",
+            f"{target_date} の初星学園への登校は記録済みです。\n"
+            "アイドルたちが待っています。プロデュース頑張ってくださいね。",
             ephemeral=True,
             view=AttendanceLaunchView(),
         )
@@ -648,7 +649,7 @@ async def announce_daily_attendance_report():
     if attendees:
         lines = [
             f"- {name}: {attended_time}"
-            for name, attended_time in attendees
+            for _user_id, name, attended_time in attendees
         ]
         body = "\n".join(lines)
     else:
