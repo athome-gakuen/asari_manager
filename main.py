@@ -190,6 +190,17 @@ def format_event_datetime(value: str) -> str:
     return target.strftime("%Y年%m月%d日 %H時%M分")
 
 
+def event_is_cancelled(event: dict) -> bool:
+    return event.get("status") == "cancelled"
+
+
+def normalize_optional_event_value(value: str) -> str:
+    cleaned = value.strip()
+    if cleaned in {"-", "なし", "削除"}:
+        return ""
+    return cleaned
+
+
 def find_event_by_message_id(data: dict, message_id: int) -> tuple[str | None, dict | None]:
     for event_id, event in data["events"].items():
         if str(event.get("message_id")) == str(message_id):
@@ -213,10 +224,17 @@ def build_event_embed(event_id: str, event: dict) -> discord.Embed:
         participant_body = "まだ参加希望者はいません。"
 
     capacity = int(event.get("capacity", 0))
+    is_cancelled = event_is_cancelled(event)
     embed = discord.Embed(
         title=str(event.get("title", "現地イベント")),
-        color=discord.Color.green(),
+        color=discord.Color.red() if is_cancelled else discord.Color.green(),
     )
+    if is_cancelled:
+        status_text = "このイベントは取り消されました。"
+        cancellation_reason = str(event.get("cancellation_reason", "")).strip()
+        if cancellation_reason:
+            status_text += f"\n理由: {cancellation_reason}"
+        embed.add_field(name="状態", value=status_text, inline=False)
     embed.add_field(
         name="参加者一覧",
         value=participant_body,
@@ -443,8 +461,12 @@ class AttendanceView(discord.ui.View):
 
 
 class EventParticipationView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, disabled: bool = False):
         super().__init__(timeout=None)
+        if disabled:
+            for item in self.children:
+                if isinstance(item, discord.ui.Button):
+                    item.disabled = True
 
     @discord.ui.button(
         label="参加する",
@@ -495,6 +517,13 @@ async def handle_event_participation(
     if event_id is None or event is None:
         await interaction.response.send_message(
             "このイベント情報が見つかりませんでした。",
+            ephemeral=True,
+        )
+        return
+
+    if event_is_cancelled(event):
+        await interaction.response.send_message(
+            "このイベントは取り消されています。",
             ephemeral=True,
         )
         return
@@ -728,6 +757,92 @@ def has_developer_role(interaction: discord.Interaction) -> bool:
         return False
 
     return any(role.id == DEVELOPER_ROLE_ID for role in user.roles)
+
+
+async def fetch_event_message(
+    interaction: discord.Interaction,
+    event: dict,
+    channel_hint: discord.TextChannel | None = None,
+) -> discord.Message | None:
+    try:
+        message_id = int(event.get("message_id"))
+    except (TypeError, ValueError):
+        return None
+
+    candidate_channels = []
+    seen_channel_ids: set[int] = set()
+
+    def add_candidate(channel) -> None:
+        channel_id = getattr(channel, "id", None)
+        if channel_id is None or channel_id in seen_channel_ids:
+            return
+        if not callable(getattr(channel, "fetch_message", None)):
+            return
+        seen_channel_ids.add(channel_id)
+        candidate_channels.append(channel)
+
+    add_candidate(channel_hint)
+
+    try:
+        stored_channel_id = int(event.get("channel_id"))
+    except (TypeError, ValueError):
+        stored_channel_id = None
+
+    if stored_channel_id is not None:
+        stored_channel = client.get_channel(stored_channel_id)
+        if stored_channel is None:
+            try:
+                stored_channel = await client.fetch_channel(stored_channel_id)
+            except discord.HTTPException:
+                stored_channel = None
+        add_candidate(stored_channel)
+
+    add_candidate(interaction.channel)
+
+    for channel in candidate_channels:
+        try:
+            return await channel.fetch_message(message_id)
+        except discord.HTTPException:
+            continue
+
+    return None
+
+
+async def active_event_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    del interaction
+    data = load_events_data()
+    current_lower = current.strip().lower()
+
+    def sort_key(item: tuple[str, dict]) -> int:
+        try:
+            return int(item[0])
+        except (TypeError, ValueError):
+            return -1
+
+    choices = []
+    for event_id, event in sorted(
+        data["events"].items(),
+        key=sort_key,
+        reverse=True,
+    ):
+        if event_is_cancelled(event):
+            continue
+        label = f"No.{event_id} {event.get('title', '現地イベント')}"
+        if current_lower and current_lower not in label.lower():
+            continue
+        choices.append(
+            app_commands.Choice(
+                name=label[:100],
+                value=str(event_id),
+            )
+        )
+        if len(choices) >= 25:
+            break
+
+    return choices
 
 
 def normalize_times_name(name: str) -> str:
@@ -1194,6 +1309,8 @@ async def event(
         "note": note or "",
         "creator_id": str(interaction.user.id),
         "created_at": now_jst().isoformat(),
+        "status": "active",
+        "channel_id": interaction.channel_id,
         "message_id": None,
         "participants": {},
     }
@@ -1208,8 +1325,273 @@ async def event(
     )
 
     data = load_events_data()
+    data["events"][event_id]["channel_id"] = message.channel.id
     data["events"][event_id]["message_id"] = message.id
     save_events_data(data)
+
+
+@client.tree.command(name="event_edit", description="作成済みの現地イベントの内容を変更します")
+@app_commands.describe(
+    event_id="変更するイベント番号",
+    title="新しいイベント名",
+    organizer="新しい企画者",
+    location="新しい開催場所",
+    budget="新しい予算",
+    capacity="新しい定員",
+    start_at="新しい開始日時 例: 2026-07-20 20:00",
+    end_at="新しい終了予定 例: 2026-07-20 22:00",
+    signup_deadline="新しい募集締切 例: 2026-07-18 23:59",
+    location_url="新しい場所リンク。削除は -",
+    note="新しい備考。削除は -",
+    message_channel="既存イベントの投稿先。通常は指定不要",
+)
+@app_commands.autocomplete(event_id=active_event_autocomplete)
+async def event_edit(
+    interaction: discord.Interaction,
+    event_id: str,
+    title: str | None = None,
+    organizer: str | None = None,
+    location: str | None = None,
+    budget: str | None = None,
+    capacity: int | None = None,
+    start_at: str | None = None,
+    end_at: str | None = None,
+    signup_deadline: str | None = None,
+    location_url: str | None = None,
+    note: str | None = None,
+    message_channel: discord.TextChannel | None = None,
+):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    if not has_developer_role(interaction):
+        await interaction.followup.send(
+            "このコマンドは developer ロールを持っている人だけ実行できます。",
+            ephemeral=True,
+        )
+        return
+
+    event_key = event_id.strip()
+    data = load_events_data()
+    event_data = data["events"].get(event_key)
+    if event_data is None:
+        await interaction.followup.send(
+            f"イベント No.{event_key} が見つかりませんでした。",
+            ephemeral=True,
+        )
+        return
+
+    if event_is_cancelled(event_data):
+        await interaction.followup.send(
+            "取り消し済みのイベントは変更できません。",
+            ephemeral=True,
+        )
+        return
+
+    updates = {}
+    for key, label, value in (
+        ("title", "イベント名", title),
+        ("organizer", "企画者", organizer),
+        ("location", "開催場所", location),
+        ("budget", "予算", budget),
+    ):
+        if value is None:
+            continue
+        cleaned = value.strip()
+        if not cleaned:
+            await interaction.followup.send(
+                f"{label}を空にはできません。",
+                ephemeral=True,
+            )
+            return
+        updates[key] = cleaned
+
+    if capacity is not None:
+        if capacity <= 0:
+            await interaction.followup.send(
+                "定員は1人以上で指定してください。",
+                ephemeral=True,
+            )
+            return
+        participant_count = len(event_data.get("participants", {}))
+        if capacity < participant_count:
+            await interaction.followup.send(
+                f"現在の参加希望者数（{participant_count}人）以上の定員を指定してください。",
+                ephemeral=True,
+            )
+            return
+        updates["capacity"] = capacity
+
+    for key, label, value in (
+        ("start_at", "開始日時", start_at),
+        ("end_at", "終了予定", end_at),
+        ("signup_deadline", "募集締切", signup_deadline),
+    ):
+        if value is None:
+            continue
+        parsed_value = parse_event_datetime(value.strip())
+        if parsed_value is None:
+            await interaction.followup.send(
+                f"{label}は `2026-07-20 20:00` または `2026/07/20 20:00` の形式で入力してください。",
+                ephemeral=True,
+            )
+            return
+        updates[key] = parsed_value.isoformat()
+
+    if location_url is not None:
+        updates["location_url"] = normalize_optional_event_value(location_url)
+    if note is not None:
+        updates["note"] = normalize_optional_event_value(note)
+
+    if not updates:
+        await interaction.followup.send(
+            "変更する項目を1つ以上指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    updated_event = dict(event_data)
+    updated_event.update(updates)
+
+    try:
+        parsed_start_at = datetime.fromisoformat(
+            str(updated_event.get("start_at"))
+        ).astimezone(JST)
+        parsed_end_at = datetime.fromisoformat(
+            str(updated_event.get("end_at"))
+        ).astimezone(JST)
+        parsed_signup_deadline = datetime.fromisoformat(
+            str(updated_event.get("signup_deadline"))
+        ).astimezone(JST)
+    except (TypeError, ValueError):
+        await interaction.followup.send(
+            "保存済みのイベント日時を読み取れませんでした。日時3項目を指定して再実行してください。",
+            ephemeral=True,
+        )
+        return
+
+    if parsed_end_at <= parsed_start_at:
+        await interaction.followup.send(
+            "終了予定は開始日時より後にしてください。",
+            ephemeral=True,
+        )
+        return
+
+    if parsed_signup_deadline > parsed_start_at:
+        await interaction.followup.send(
+            "募集締切は開始日時以前にしてください。",
+            ephemeral=True,
+        )
+        return
+
+    event_message = await fetch_event_message(
+        interaction,
+        event_data,
+        channel_hint=message_channel,
+    )
+    if event_message is None:
+        await interaction.followup.send(
+            "イベント投稿が見つかりませんでした。既存イベントの場合は投稿と同じチャンネルで実行するか、message_channelを指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    updated_event["updated_by"] = str(interaction.user.id)
+    updated_event["updated_at"] = now_jst().isoformat()
+    updated_event["channel_id"] = event_message.channel.id
+
+    try:
+        await event_message.edit(
+            embed=build_event_embed(event_key, updated_event),
+            view=EventParticipationView(),
+        )
+    except discord.HTTPException:
+        await interaction.followup.send(
+            "イベント投稿の更新に失敗しました。Botの権限と投稿が残っているかを確認してください。",
+            ephemeral=True,
+        )
+        return
+
+    data["events"][event_key] = updated_event
+    save_events_data(data)
+    await interaction.followup.send(
+        f"イベント No.{event_key} の内容を変更しました。",
+        ephemeral=True,
+    )
+
+
+@client.tree.command(name="event_cancel", description="作成済みの現地イベントを取り消します")
+@app_commands.describe(
+    event_id="取り消すイベント番号",
+    reason="取り消し理由",
+    message_channel="既存イベントの投稿先。通常は指定不要",
+)
+@app_commands.autocomplete(event_id=active_event_autocomplete)
+async def event_cancel(
+    interaction: discord.Interaction,
+    event_id: str,
+    reason: str | None = None,
+    message_channel: discord.TextChannel | None = None,
+):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    if not has_developer_role(interaction):
+        await interaction.followup.send(
+            "このコマンドは developer ロールを持っている人だけ実行できます。",
+            ephemeral=True,
+        )
+        return
+
+    event_key = event_id.strip()
+    data = load_events_data()
+    event_data = data["events"].get(event_key)
+    if event_data is None:
+        await interaction.followup.send(
+            f"イベント No.{event_key} が見つかりませんでした。",
+            ephemeral=True,
+        )
+        return
+
+    if event_is_cancelled(event_data):
+        await interaction.followup.send(
+            "このイベントはすでに取り消されています。",
+            ephemeral=True,
+        )
+        return
+
+    updated_event = dict(event_data)
+    updated_event["status"] = "cancelled"
+    updated_event["cancellation_reason"] = reason.strip() if reason else ""
+    updated_event["cancelled_by"] = str(interaction.user.id)
+    updated_event["cancelled_at"] = now_jst().isoformat()
+
+    event_message = await fetch_event_message(
+        interaction,
+        event_data,
+        channel_hint=message_channel,
+    )
+    message_updated = False
+    if event_message is not None:
+        updated_event["channel_id"] = event_message.channel.id
+        try:
+            await event_message.edit(
+                embed=build_event_embed(event_key, updated_event),
+                view=EventParticipationView(disabled=True),
+            )
+            message_updated = True
+        except discord.HTTPException:
+            pass
+
+    data["events"][event_key] = updated_event
+    save_events_data(data)
+
+    if message_updated:
+        response_text = f"イベント No.{event_key} を取り消しました。"
+    else:
+        response_text = (
+            f"イベント No.{event_key} を取り消しましたが、元の投稿は更新できませんでした。"
+            "既存イベントの場合は投稿と同じチャンネルで実行するか、message_channelを指定してください。"
+        )
+    await interaction.followup.send(response_text, ephemeral=True)
 
 
 @client.tree.command(name="checkbot", description="Botのsystemdステータスを確認します")
