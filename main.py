@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import ipaddress
+import secrets
 import subprocess
 import urllib.request
 from datetime import date, datetime, time, timedelta, timezone
@@ -61,6 +62,10 @@ BOTS_FILE = BASE_DIR / "bots.yml"
 SYSTEMCTL = "/bin/systemctl"
 JOURNALCTL = "/bin/journalctl"
 ASARI_MANAGER_SERVICE = "asari_manager.service"
+DICE_DEFAULT_MAX_VALUE = 6
+DICE_DEFAULT_COUNT = 1
+DICE_MAX_VALUE = 1_000_000
+DICE_MAX_COUNT = 100
 
 
 def load_bots() -> dict:
@@ -90,6 +95,10 @@ def today_jst() -> date:
 
 def now_jst() -> datetime:
     return datetime.now(JST)
+
+
+def roll_dice(max_value: int, count: int) -> list[int]:
+    return [secrets.randbelow(max_value) + 1 for _ in range(count)]
 
 
 ATTENDANCE_CLOSE_TIME = time(hour=23, minute=59, tzinfo=JST)
@@ -900,6 +909,39 @@ async def ip(interaction: discord.Interaction):
     await interaction.followup.send(
         f"このBotサーバーのグローバルIPアドレスは `{global_ip}` です。"
     )
+
+
+@client.tree.command(name="dice", description="サイコロを振ります")
+@app_commands.describe(
+    max_value="サイコロの最大出目（1～1,000,000、未指定は6）",
+    count="振るサイコロの数（1～100、未指定は1）",
+)
+async def dice(
+    interaction: discord.Interaction,
+    max_value: int = DICE_DEFAULT_MAX_VALUE,
+    count: int = DICE_DEFAULT_COUNT,
+):
+    if not 1 <= max_value <= DICE_MAX_VALUE:
+        await interaction.response.send_message(
+            f"最大出目は1～{DICE_MAX_VALUE:,}の範囲で指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    if not 1 <= count <= DICE_MAX_COUNT:
+        await interaction.response.send_message(
+            f"サイコロの数は1～{DICE_MAX_COUNT}の範囲で指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    rolls = roll_dice(max_value, count)
+    rolls_text = ", ".join(str(roll) for roll in rolls)
+    message = f"🎲 **{count}d{max_value}** の結果: `{rolls_text}`"
+    if count > 1:
+        message += f"\n合計: **{sum(rolls)}**"
+
+    await interaction.response.send_message(message)
 
 
 async def bot_autocomplete(
