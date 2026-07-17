@@ -1513,15 +1513,46 @@ async def event_edit(
 
     data["events"][event_key] = updated_event
     save_events_data(data)
+
+    changed_field_labels = {
+        "title": "イベント名",
+        "organizer": "企画者",
+        "location": "開催場所",
+        "budget": "予算",
+        "capacity": "定員",
+        "start_at": "開始日時",
+        "end_at": "終了予定",
+        "signup_deadline": "募集締切",
+        "location_url": "場所リンク",
+        "note": "備考",
+    }
+    changed_fields = "、".join(
+        changed_field_labels[key]
+        for key in updates
+    )
+    notification_sent = True
+    try:
+        await event_message.channel.send(
+            f"【イベント更新】イベント No.{event_key}「{updated_event['title']}」が更新されました。\n"
+            f"変更項目: {changed_fields}\n"
+            f"更新者: {interaction.user.mention}\n"
+            f"{event_message.jump_url}"
+        )
+    except discord.HTTPException:
+        notification_sent = False
+
+    response_text = f"イベント No.{event_key} の内容を変更しました。"
+    if not notification_sent:
+        response_text += " ただし、イベント企画チャンネルへの更新通知に失敗しました。"
     await interaction.followup.send(
-        f"イベント No.{event_key} の内容を変更しました。",
+        response_text,
         ephemeral=True,
     )
 
 
-@client.tree.command(name="event_cancel", description="作成済みの現地イベントを取り消します")
+@client.tree.command(name="event_cancel", description="現地イベントを取り消して募集投稿を削除します")
 @app_commands.describe(
-    event_id="取り消すイベント番号",
+    event_id="取り消して削除するイベント番号",
     reason="取り消し理由",
     message_channel="既存イベントの投稿先。通常は指定不要",
 )
@@ -1569,28 +1600,44 @@ async def event_cancel(
         event_data,
         channel_hint=message_channel,
     )
-    message_updated = False
-    if event_message is not None:
-        updated_event["channel_id"] = event_message.channel.id
-        try:
-            await event_message.edit(
-                embed=build_event_embed(event_key, updated_event),
-                view=EventParticipationView(disabled=True),
-            )
-            message_updated = True
-        except discord.HTTPException:
-            pass
+    if event_message is None:
+        await interaction.followup.send(
+            "削除するイベント投稿が見つかりませんでした。既存イベントの場合はイベント企画チャンネルで実行するか、message_channelを指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    event_channel = event_message.channel
+    updated_event["channel_id"] = event_channel.id
+    updated_event["message_deleted"] = True
+    updated_event["message_deleted_at"] = now_jst().isoformat()
+
+    try:
+        await event_message.delete()
+    except discord.HTTPException:
+        await interaction.followup.send(
+            "イベント投稿の削除に失敗しました。Botの権限と投稿が残っているかを確認してください。",
+            ephemeral=True,
+        )
+        return
 
     data["events"][event_key] = updated_event
     save_events_data(data)
 
-    if message_updated:
-        response_text = f"イベント No.{event_key} を取り消しました。"
-    else:
-        response_text = (
-            f"イベント No.{event_key} を取り消しましたが、元の投稿は更新できませんでした。"
-            "既存イベントの場合は投稿と同じチャンネルで実行するか、message_channelを指定してください。"
+    cancellation_reason = updated_event["cancellation_reason"] or "理由の記載なし"
+    notification_sent = True
+    try:
+        await event_channel.send(
+            f"【イベント削除】イベント No.{event_key}「{event_data.get('title', '現地イベント')}」は削除されました。\n"
+            f"理由: {cancellation_reason}\n"
+            f"削除者: {interaction.user.mention}"
         )
+    except discord.HTTPException:
+        notification_sent = False
+
+    response_text = f"イベント No.{event_key} の募集投稿を削除しました。"
+    if not notification_sent:
+        response_text += " ただし、イベント企画チャンネルへの削除通知に失敗しました。"
     await interaction.followup.send(response_text, ephemeral=True)
 
 
