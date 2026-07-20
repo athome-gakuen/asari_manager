@@ -302,7 +302,9 @@ def iso_week_key(target: date) -> str:
     return f"{year}-W{week:02d}"
 
 
-def build_weekly_ranking(target: date) -> tuple[str, list[tuple[str, int]]]:
+def build_weekly_ranking(
+    target: date,
+) -> tuple[str, list[tuple[str, str, int]]]:
     data = load_attendance_data()
     start, end = week_range(target)
     counts: dict[str, dict[str, object]] = {}
@@ -322,8 +324,11 @@ def build_weekly_ranking(target: date) -> tuple[str, list[tuple[str, int]]]:
         current += timedelta(days=1)
 
     ranking = sorted(
-        ((str(user["name"]), int(user["count"])) for user in counts.values()),
-        key=lambda item: (-item[1], item[0].casefold()),
+        (
+            (str(user_id), str(user["name"]), int(user["count"]))
+            for user_id, user in counts.items()
+        ),
+        key=lambda item: (-item[2], item[1].casefold()),
     )
     period = f"{start.isoformat()} 〜 {end.isoformat()}"
     return period, ranking
@@ -597,6 +602,7 @@ class AsariManager(discord.Client):
         await self.tree.sync(guild=guild)
         post_daily_attendance_button.start()
         disable_daily_attendance_button.start()
+        announce_daily_attendance_report.start()
         announce_weekly_attendance_ranking.start()
 
 
@@ -708,11 +714,13 @@ async def before_announce_daily_attendance_report():
     await client.wait_until_ready()
 
 
-@tasks.loop(time=time(hour=20, minute=0, tzinfo=JST))
+@tasks.loop(time=time(hour=0, minute=5, tzinfo=JST))
 async def announce_weekly_attendance_ranking():
-    target = today_jst()
-    if target.weekday() != 6:
+    current_date = today_jst()
+    if current_date.weekday() != 0:
         return
+
+    target = current_date - timedelta(days=1)
 
     week_key = iso_week_key(target)
     data = load_attendance_data()
@@ -727,8 +735,8 @@ async def announce_weekly_attendance_ranking():
     period, ranking = build_weekly_ranking(target)
     if ranking:
         lines = [
-            f"{index}. {name}: {count}日"
-            for index, (name, count) in enumerate(ranking, start=1)
+            f"{index}. <@{user_id}>: {count}日"
+            for index, (user_id, _name, count) in enumerate(ranking, start=1)
         ]
         body = "\n".join(lines)
     else:
@@ -737,7 +745,12 @@ async def announce_weekly_attendance_ranking():
     await channel.send(
         f"今週の登校ランキングを発表します。\n"
         f"集計期間: {period}\n\n"
-        f"{body}"
+        f"{body}",
+        allowed_mentions=discord.AllowedMentions(
+            everyone=False,
+            users=True,
+            roles=False,
+        ),
     )
 
     data = load_attendance_data()
