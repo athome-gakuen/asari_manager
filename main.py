@@ -66,6 +66,7 @@ DICE_DEFAULT_MAX_VALUE = 6
 DICE_DEFAULT_COUNT = 1
 DICE_MAX_VALUE = 1_000_000
 DICE_MAX_COUNT = 100
+EVENT_LIST_MAX_ITEMS = 10
 
 
 def load_bots() -> dict:
@@ -192,6 +193,154 @@ def format_event_datetime(value: str) -> str:
 
 def event_is_cancelled(event: dict) -> bool:
     return event.get("status") == "cancelled"
+
+
+def build_event_start_message(event_id: str, event: dict) -> str:
+    title = str(event.get("title", "現地イベント"))
+    location = str(event.get("location", "未設定"))
+    location_url = str(event.get("location_url", "")).strip()
+
+    participant_ids = [
+        str(user_id)
+        for user_id in event.get("participants", {})
+        if str(user_id).isdigit()
+    ]
+    displayed_participants = participant_ids[:50]
+    if displayed_participants:
+        participant_text = " ".join(
+            f"<@{user_id}>" for user_id in displayed_participants
+        )
+        if len(participant_ids) > len(displayed_participants):
+            participant_text += (
+                f" ほか{len(participant_ids) - len(displayed_participants)}人"
+            )
+    else:
+        participant_text = "参加予定者はまだ登録されていません。"
+
+    lines = [
+        "🎉 **イベント開始のお知らせ**",
+        f"イベント No.{event_id}「{title}」の開始時刻になりました！",
+        f"開催場所: {location}",
+    ]
+    if location_url:
+        lines.append(f"場所リンク: {location_url}")
+    lines.extend(
+        [
+            "",
+            f"参加予定: {participant_text}",
+            "参加される皆さんは、気を付けてお集まりください。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def parse_stored_event_datetime(event: dict, key: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(event.get(key))).astimezone(JST)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_event_list_embed(
+    data: dict,
+    guild_id: int | None,
+    current: datetime | None = None,
+) -> discord.Embed:
+    current_time = current or now_jst()
+    upcoming_events = []
+
+    for event_id, event in data["events"].items():
+        if event_is_cancelled(event):
+            continue
+
+        start_at = parse_stored_event_datetime(event, "start_at")
+        end_at = parse_stored_event_datetime(event, "end_at")
+        if start_at is None or end_at is None or end_at <= current_time:
+            continue
+
+        upcoming_events.append((start_at, str(event_id), event, end_at))
+
+    upcoming_events.sort(key=lambda item: (item[0], item[1]))
+    embed = discord.Embed(
+        title="現地イベント一覧",
+        color=discord.Color.blue(),
+    )
+
+    if not upcoming_events:
+        embed.description = "現在、開催中または開催予定のイベントはありません。"
+        return embed
+
+    embed.description = (
+        "開催中・今後開催のイベントを開始日時順に表示しています。"
+    )
+    displayed_events = upcoming_events[:EVENT_LIST_MAX_ITEMS]
+
+    for start_at, event_id, event, end_at in displayed_events:
+        signup_deadline = parse_stored_event_datetime(
+            event,
+            "signup_deadline",
+        )
+        if start_at <= current_time:
+            status = "🟢 開催中"
+        elif signup_deadline is None:
+            status = "⚪ 募集状況不明"
+        elif current_time <= signup_deadline:
+            status = "🔵 参加募集中"
+        else:
+            status = "⚪ 募集終了"
+
+        participants = event.get("participants", {})
+        participant_count = (
+            len(participants) if isinstance(participants, dict) else 0
+        )
+        try:
+            capacity = int(event.get("capacity", 0))
+        except (TypeError, ValueError):
+            capacity = 0
+        capacity_text = str(capacity) if capacity > 0 else "上限なし"
+
+        title = str(event.get("title", "現地イベント")).strip()
+        if not title:
+            title = "現地イベント"
+        field_name = f"{status}｜No.{event_id} {title}"[:256]
+
+        location = str(event.get("location", "未設定")).strip() or "未設定"
+        lines = [
+            f"開始: {start_at.strftime('%Y年%m月%d日 %H時%M分')}",
+            f"終了: {end_at.strftime('%Y年%m月%d日 %H時%M分')}",
+            f"場所: {location[:300]}",
+            f"参加人数: {participant_count} / {capacity_text}人",
+        ]
+
+        if guild_id is not None:
+            try:
+                channel_id = int(event.get("channel_id"))
+                message_id = int(event.get("message_id"))
+            except (TypeError, ValueError):
+                pass
+            else:
+                message_url = (
+                    "https://discord.com/channels/"
+                    f"{guild_id}/{channel_id}/{message_id}"
+                )
+                lines.append(f"[募集投稿を開く]({message_url})")
+
+        embed.add_field(
+            name=field_name,
+            value="\n".join(lines),
+            inline=False,
+        )
+
+    remaining_count = len(upcoming_events) - len(displayed_events)
+    if remaining_count > 0:
+        embed.set_footer(
+            text=(
+                f"直近{EVENT_LIST_MAX_ITEMS}件を表示しています。"
+                f"ほか{remaining_count}件あります。"
+            )
+        )
+
+    return embed
 
 
 def normalize_optional_event_value(value: str) -> str:
@@ -604,6 +753,7 @@ class AsariManager(discord.Client):
         disable_daily_attendance_button.start()
         announce_daily_attendance_report.start()
         announce_weekly_attendance_ranking.start()
+        announce_event_starts.start()
 
 
 client = AsariManager()
@@ -621,6 +771,85 @@ async def get_attendance_channel():
         return channel
 
     return None
+
+
+async def get_event_channel(event: dict):
+    try:
+        channel_id = int(event.get("channel_id"))
+    except (TypeError, ValueError):
+        return None
+
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except discord.DiscordException:
+            return None
+
+    if callable(getattr(channel, "send", None)):
+        return channel
+
+    return None
+
+
+@tasks.loop(minutes=1)
+async def announce_event_starts():
+    current = now_jst()
+    data = load_events_data()
+
+    for event_id, event in data["events"].items():
+        if event_is_cancelled(event) or event.get("start_announced_at"):
+            continue
+
+        try:
+            start_at = datetime.fromisoformat(
+                str(event.get("start_at"))
+            ).astimezone(JST)
+            end_at = datetime.fromisoformat(
+                str(event.get("end_at"))
+            ).astimezone(JST)
+        except (TypeError, ValueError):
+            continue
+
+        if current < start_at or current >= end_at:
+            continue
+
+        channel = await get_event_channel(event)
+        if channel is None:
+            print(
+                f"Event channel not found for event No.{event_id}: "
+                f"{event.get('channel_id')}"
+            )
+            continue
+
+        try:
+            message = await channel.send(
+                build_event_start_message(str(event_id), event),
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    roles=False,
+                    users=True,
+                ),
+            )
+        except discord.DiscordException as error:
+            print(
+                f"Failed to announce event No.{event_id} start: {error}"
+            )
+            continue
+
+        latest_data = load_events_data()
+        latest_event = latest_data["events"].get(str(event_id))
+        if latest_event is None:
+            continue
+
+        latest_event["start_announced_at"] = current.isoformat()
+        latest_event["start_announcement_message_id"] = message.id
+        save_events_data(latest_data)
+
+
+@announce_event_starts.before_loop
+async def before_announce_event_starts():
+    await client.wait_until_ready()
 
 
 @tasks.loop(time=time(hour=8, minute=0, tzinfo=JST))
@@ -1240,6 +1469,16 @@ async def reboot(
         )
 
 
+@client.tree.command(
+    name="event_list",
+    description="開催中・開催予定の現地イベントを一覧表示します",
+)
+async def event_list(interaction: discord.Interaction):
+    data = load_events_data()
+    embed = build_event_list_embed(data, interaction.guild_id)
+    await interaction.response.send_message(embed=embed)
+
+
 @client.tree.command(name="event", description="現地イベントの参加募集を作成します")
 @app_commands.describe(
     title="イベント名",
@@ -1464,6 +1703,12 @@ async def event_edit(
 
     updated_event = dict(event_data)
     updated_event.update(updates)
+    if (
+        "start_at" in updates
+        and updates["start_at"] != event_data.get("start_at")
+    ):
+        updated_event.pop("start_announced_at", None)
+        updated_event.pop("start_announcement_message_id", None)
 
     try:
         parsed_start_at = datetime.fromisoformat(
