@@ -1481,22 +1481,6 @@ async def deploy(
         )
 
 
-@client.tree.command(name="reboot", description="asari_managerを更新して再起動します")
-async def reboot(
-    interaction: discord.Interaction,
-):
-    await interaction.response.defer(thinking=True)
-
-    if not has_developer_role(interaction):
-        await interaction.followup.send(
-            "このコマンドは developer ロールを持っている人だけ実行できます。",
-            ephemeral=True,
-        )
-        return
-
-    await deploy_asari_manager(interaction)
-
-
 @client.tree.command(
     name="event_list",
     description="開催中・開催予定の現地イベントを一覧表示します",
