@@ -62,6 +62,7 @@ BOTS_FILE = BASE_DIR / "bots.yml"
 SYSTEMCTL = "/bin/systemctl"
 JOURNALCTL = "/bin/journalctl"
 ASARI_MANAGER_SERVICE = "asari_manager.service"
+ASARI_MANAGER_DEPLOY_NAME = "asari_manager"
 DICE_DEFAULT_MAX_VALUE = 6
 DICE_DEFAULT_COUNT = 1
 DICE_MAX_VALUE = 1_000_000
@@ -1319,9 +1320,75 @@ async def bot_autocomplete(
     ]
 
 
+async def deploy_bot_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    del interaction
+    bot_names = set(load_bots().keys())
+    bot_names.add(ASARI_MANAGER_DEPLOY_NAME)
+    matched = [
+        name for name in sorted(bot_names)
+        if current.lower() in name.lower()
+    ]
+    return [
+        app_commands.Choice(name=name, value=name)
+        for name in matched[:25]
+    ]
+
+
+async def deploy_asari_manager(
+    interaction: discord.Interaction,
+) -> None:
+    await interaction.followup.send("あさり先生の再起動準備を行います。")
+
+    base_dir = str(BASE_DIR)
+    ok, output = run_command(
+        ["git", "fetch", "origin"],
+        cwd=base_dir,
+    )
+    if not ok:
+        await interaction.followup.send(
+            f"あさり先生の `git fetch` に失敗しました。\n{code_block(output)}"
+        )
+        return
+
+    ok, output = run_command(
+        ["git", "reset", "--hard", "origin/main"],
+        cwd=base_dir,
+    )
+    if not ok:
+        await interaction.followup.send(
+            f"あさり先生の `git reset` に失敗しました。\n{code_block(output)}"
+        )
+        return
+
+    ok, output = run_command(
+        [f"{base_dir}/.venv/bin/pip", "install", "-r", "requirements.txt"],
+        cwd=base_dir,
+    )
+    if not ok:
+        await interaction.followup.send(
+            f"あさり先生のライブラリ更新に失敗しました。\n{code_block(output)}"
+        )
+        return
+
+    await interaction.followup.send(
+        "あさり先生の更新が終わりました。これから再起動します。"
+    )
+
+    ok, output = run_command(
+        ["sudo", "-n", SYSTEMCTL, "restart", ASARI_MANAGER_SERVICE],
+    )
+    if not ok:
+        await interaction.followup.send(
+            f"あさり先生の再起動に失敗しました。\n{code_block(output)}"
+        )
+
+
 @client.tree.command(name="deploy", description="指定したBotを更新して再起動します")
 @app_commands.describe(bot="デプロイするBotを選択してください")
-@app_commands.autocomplete(bot=bot_autocomplete)
+@app_commands.autocomplete(bot=deploy_bot_autocomplete)
 async def deploy(
     interaction: discord.Interaction,
     bot: str,
@@ -1336,6 +1403,10 @@ async def deploy(
         return
 
     bots = load_bots()
+
+    if bot == ASARI_MANAGER_DEPLOY_NAME:
+        await deploy_asari_manager(interaction)
+        return
 
     if bot not in bots:
         await interaction.followup.send(
@@ -1423,50 +1494,7 @@ async def reboot(
         )
         return
 
-    await interaction.followup.send("あさり先生の再起動準備を行います。")
-
-    base_dir = str(BASE_DIR)
-    ok, output = run_command(
-        ["git", "fetch", "origin"],
-        cwd=base_dir,
-    )
-    if not ok:
-        await interaction.followup.send(
-            f"あさり先生の `git fetch` に失敗しました。\n{code_block(output)}"
-        )
-        return
-
-    ok, output = run_command(
-        ["git", "reset", "--hard", "origin/main"],
-        cwd=base_dir,
-    )
-    if not ok:
-        await interaction.followup.send(
-            f"あさり先生の `git reset` に失敗しました。\n{code_block(output)}"
-        )
-        return
-
-    ok, output = run_command(
-        [f"{base_dir}/.venv/bin/pip", "install", "-r", "requirements.txt"],
-        cwd=base_dir,
-    )
-    if not ok:
-        await interaction.followup.send(
-            f"あさり先生のライブラリ更新に失敗しました。\n{code_block(output)}"
-        )
-        return
-
-    await interaction.followup.send(
-        "あさり先生の更新が終わりました。これから再起動します。"
-    )
-
-    ok, output = run_command(
-        ["sudo", "-n", SYSTEMCTL, "restart", ASARI_MANAGER_SERVICE],
-    )
-    if not ok:
-        await interaction.followup.send(
-            f"あさり先生の再起動に失敗しました。\n{code_block(output)}"
-        )
+    await deploy_asari_manager(interaction)
 
 
 @client.tree.command(
