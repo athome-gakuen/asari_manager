@@ -567,9 +567,13 @@ class AttendanceView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
+        # Discord requires an initial response within about three seconds.
+        # Acknowledge the button press before doing any file I/O.
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
         user = interaction.user
         if user.bot:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Botは初星学園への登校記録の対象外です。",
                 ephemeral=True,
             )
@@ -584,7 +588,7 @@ class AttendanceView(discord.ui.View):
         )
 
         if message_date != target_date or attendance_closed():
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Today's attendance button is closed.",
                 ephemeral=True,
             )
@@ -593,7 +597,7 @@ class AttendanceView(discord.ui.View):
         day_data = data["attendance"].setdefault(target_date, {})
 
         if user_id in day_data:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"{target_date} の初星学園への登校は記録済みです。\n"
                 "アイドルたちが待っています。プロデュース頑張ってくださいね。",
                 ephemeral=True,
@@ -605,9 +609,17 @@ class AttendanceView(discord.ui.View):
             "name": user.display_name,
             "attended_at": now_jst().isoformat(),
         }
-        save_attendance_data(data)
+        try:
+            save_attendance_data(data)
+        except OSError as error:
+            print(f"Failed to save attendance data: {error}")
+            await interaction.followup.send(
+                "登校記録の保存に失敗しました。しばらくしてからもう一度お試しください。",
+                ephemeral=True,
+            )
+            return
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"{target_date} の初星学園への登校は記録済みです。\n"
             "アイドルたちが待っています。プロデュース頑張ってくださいね。",
             ephemeral=True,
