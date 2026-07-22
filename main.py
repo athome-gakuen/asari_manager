@@ -752,7 +752,7 @@ class AsariManager(discord.Client):
         await self.tree.sync(guild=guild)
         post_daily_attendance_button.start()
         disable_daily_attendance_button.start()
-        announce_daily_attendance_report.start()
+        # The daily 10:00 attendance report is intentionally not scheduled.
         announce_weekly_attendance_ranking.start()
         announce_event_starts.start()
 
