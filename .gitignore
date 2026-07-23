@@ -220,3 +220,7 @@ __marimo__/
 # Runtime attendance data
 attendance.json
 attendance.json.tmp
+
+# Runtime goods data
+goods.json
+goods.json.tmp
