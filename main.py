@@ -1396,10 +1396,7 @@ def has_developer_role(interaction: discord.Interaction) -> bool:
 
 
 def can_manage_goods(interaction: discord.Interaction, item: dict) -> bool:
-    return (
-        str(interaction.user.id) == str(item.get("creator_id"))
-        or has_developer_role(interaction)
-    )
+    return str(interaction.user.id) == str(item.get("creator_id"))
 
 
 def find_goods_for_command(
@@ -1483,7 +1480,6 @@ async def manageable_goods_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     data = load_goods_data()
     current_lower = current.strip().lower()
-    developer = has_developer_role(interaction)
 
     def sort_key(entry: tuple[str, dict]) -> int:
         try:
@@ -1499,7 +1495,7 @@ async def manageable_goods_autocomplete(
     ):
         if item.get("status") in {"completed", "cancelled", "expired"}:
             continue
-        if not developer and str(item.get("creator_id")) != str(interaction.user.id):
+        if str(item.get("creator_id")) != str(interaction.user.id):
             continue
         label = (
             f"No.{goods_id} [{goods_status_label(item)}] "
@@ -2727,7 +2723,7 @@ async def goods_applicants(
         return
     if not can_manage_goods(interaction, item):
         await interaction.response.send_message(
-            "希望者を確認できるのは譲渡者本人またはdeveloperだけです。",
+            "希望者を確認できるのは、この募集を作成した本人だけです。",
             ephemeral=True,
         )
         return
@@ -2784,7 +2780,7 @@ async def goods_select(
             return
         if not can_manage_goods(interaction, item):
             await interaction.followup.send(
-                "譲渡先を決定できるのは譲渡者本人またはdeveloperだけです。",
+                "譲渡先を決定できるのは、この募集を作成した本人だけです。",
                 ephemeral=True,
             )
             return
@@ -2989,7 +2985,7 @@ async def goods_edit(
             return
         if not can_manage_goods(interaction, item):
             await interaction.followup.send(
-                "編集できるのは譲渡者本人またはdeveloperだけです。",
+                "編集できるのは、この募集を作成した本人だけです。",
                 ephemeral=True,
             )
             return
@@ -3095,7 +3091,7 @@ async def goods_complete(
             return
         if not can_manage_goods(interaction, item):
             await interaction.followup.send(
-                "完了にできるのは譲渡者本人またはdeveloperだけです。",
+                "完了にできるのは、この募集を作成した本人だけです。",
                 ephemeral=True,
             )
             return
@@ -3193,7 +3189,7 @@ async def goods_cancel(
             return
         if not can_manage_goods(interaction, item):
             await interaction.followup.send(
-                "取り消せるのは譲渡者本人またはdeveloperだけです。",
+                "取り消せるのは、この募集を作成した本人だけです。",
                 ephemeral=True,
             )
             return
