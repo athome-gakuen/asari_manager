@@ -47,9 +47,11 @@ SERVER_ID = CONFIG["SERVER_ID"]
 DEVELOPER_ROLE_ID = CONFIG["DEVELOPER_ROLE_ID"]
 ATTENDANCE_CHANNEL_ID = CONFIG["ATTENDANCE_CHANNEL_ID"]
 TIMES_CATEGORY_ID = CONFIG["TIMES_CATEGORY_ID"]
+GOODS_CATEGORY_ID = CONFIG["GOODS_CATEGORY_ID"]
 JST = timezone(timedelta(hours=9))
 ATTENDANCE_FILE = Path(__file__).with_name("attendance.json")
 EVENTS_FILE = Path(__file__).with_name("events.json")
+GOODS_FILE = Path(__file__).with_name("goods.json")
 
 GAKUMAS_IOS_URL = "https://apps.apple.com/jp/app/id6446659989"
 GAKUMAS_ANDROID_URL = (
@@ -68,6 +70,8 @@ DICE_DEFAULT_COUNT = 1
 DICE_MAX_VALUE = 1_000_000
 DICE_MAX_COUNT = 100
 EVENT_LIST_MAX_ITEMS = 10
+GOODS_LIST_MAX_ITEMS = 10
+GOODS_DATA_LOCK = asyncio.Lock()
 
 
 def load_bots() -> dict:
@@ -173,6 +177,31 @@ def save_events_data(data: dict) -> None:
     with tmp_path.open("w", encoding="utf-8") as file:
         json.dump(data, file, ensure_ascii=False, indent=2)
     tmp_path.replace(EVENTS_FILE)
+
+
+def load_goods_data() -> dict:
+    if not GOODS_FILE.exists():
+        return {
+            "next_id": 1,
+            "items": {},
+        }
+
+    try:
+        with GOODS_FILE.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (json.JSONDecodeError, OSError):
+        data = {}
+
+    data.setdefault("next_id", 1)
+    data.setdefault("items", {})
+    return data
+
+
+def save_goods_data(data: dict) -> None:
+    tmp_path = GOODS_FILE.with_suffix(".json.tmp")
+    with tmp_path.open("w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, indent=2)
+    tmp_path.replace(GOODS_FILE)
 
 
 def parse_event_datetime(value: str) -> datetime | None:
@@ -438,6 +467,221 @@ def build_event_embed(event_id: str, event: dict) -> discord.Embed:
         embed.add_field(name="備考", value=note, inline=False)
 
     embed.set_footer(text=f"イベント No.{event_id}")
+    return embed
+
+
+GOODS_STATUS_LABELS = {
+    "active": "受付中",
+    "reserved": "譲渡先決定",
+    "completed": "譲渡完了",
+    "cancelled": "取り消し",
+    "expired": "期限切れ",
+}
+
+
+def goods_status_label(item: dict) -> str:
+    return GOODS_STATUS_LABELS.get(str(item.get("status")), "状態不明")
+
+
+def goods_is_closed(item: dict) -> bool:
+    return item.get("status") in {
+        "reserved",
+        "completed",
+        "cancelled",
+        "expired",
+    }
+
+
+def format_goods_price(price: object) -> str:
+    if price in (None, ""):
+        return "無料"
+
+    try:
+        amount = int(price)
+    except (TypeError, ValueError):
+        return "未設定"
+
+    if amount == 0:
+        return "無料"
+    return f"{amount:,}円"
+
+
+def normalize_goods_channel_name(
+    goods_id: str,
+    name: str,
+    status: str = "active",
+) -> str:
+    cleaned = name.strip().lower()
+    cleaned = "".join(
+        character if character.isalnum() or character in ("-", "_") else "-"
+        for character in cleaned
+    )
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    cleaned = cleaned.strip("_-") or "item"
+
+    status_prefixes = {
+        "active": "goods",
+        "reserved": "reserved-goods",
+        "completed": "closed-goods",
+        "cancelled": "cancelled-goods",
+        "expired": "expired-goods",
+    }
+    prefix = status_prefixes.get(status, "goods")
+    try:
+        formatted_id = f"{int(goods_id):04d}"
+    except (TypeError, ValueError):
+        formatted_id = str(goods_id)
+
+    fixed_part = f"{prefix}-{formatted_id}-"
+    return f"{fixed_part}{cleaned[:100 - len(fixed_part)]}"
+
+
+def build_goods_post_name(name: str) -> str:
+    cleaned = " ".join(name.strip().split()) or "グッズ"
+    return f"{cleaned}の譲渡募集"[:100]
+
+
+def find_goods_by_context(
+    data: dict,
+    message_id: int | None = None,
+    channel_id: int | None = None,
+) -> tuple[str | None, dict | None]:
+    for goods_id, item in data["items"].items():
+        if message_id is not None and str(item.get("message_id")) == str(message_id):
+            return str(goods_id), item
+        if channel_id is not None and str(item.get("post_thread_id")) == str(channel_id):
+            return str(goods_id), item
+    return None, None
+
+
+def build_goods_embed(goods_id: str, item: dict) -> discord.Embed:
+    status = str(item.get("status", "active"))
+    colors = {
+        "active": discord.Color.green(),
+        "reserved": discord.Color.gold(),
+        "completed": discord.Color.blue(),
+        "cancelled": discord.Color.red(),
+        "expired": discord.Color.light_grey(),
+    }
+    embed = discord.Embed(
+        title=f"【{goods_status_label(item)}】{item.get('name', 'グッズ')}",
+        color=colors.get(status, discord.Color.light_grey()),
+    )
+    embed.add_field(
+        name="譲渡者",
+        value=f"<@{item.get('creator_id')}>",
+        inline=True,
+    )
+    embed.add_field(
+        name="金額",
+        value=format_goods_price(item.get("price")),
+        inline=True,
+    )
+    embed.add_field(
+        name="個数",
+        value=f"{item.get('quantity', 1)}個",
+        inline=True,
+    )
+
+    condition = str(item.get("condition", "")).strip()
+    if condition:
+        embed.add_field(name="状態", value=condition[:1024], inline=False)
+
+    description = str(item.get("description", "")).strip()
+    if description:
+        embed.add_field(name="説明", value=description[:1024], inline=False)
+
+    deadline = str(item.get("deadline", "")).strip()
+    embed.add_field(
+        name="募集期限",
+        value=format_event_datetime(deadline) if deadline else "期限なし",
+        inline=True,
+    )
+    applicants = item.get("applicants", {})
+    applicant_count = len(applicants) if isinstance(applicants, dict) else 0
+    embed.add_field(
+        name="希望者",
+        value=f"{applicant_count}人",
+        inline=True,
+    )
+
+    recipient_id = str(item.get("recipient_id", "")).strip()
+    if recipient_id:
+        embed.add_field(
+            name="譲渡先",
+            value=f"<@{recipient_id}>",
+            inline=True,
+        )
+
+    cancellation_reason = str(item.get("cancellation_reason", "")).strip()
+    if status == "cancelled" and cancellation_reason:
+        embed.add_field(
+            name="取り消し理由",
+            value=cancellation_reason[:1024],
+            inline=False,
+        )
+
+    image_url = str(item.get("image_url", "")).strip()
+    if image_url:
+        embed.set_image(url=image_url)
+    embed.set_footer(text=f"グッズNo.{goods_id}")
+    return embed
+
+
+def build_goods_list_embed(data: dict, guild_id: int | None) -> discord.Embed:
+    active_items = [
+        (str(goods_id), item)
+        for goods_id, item in data["items"].items()
+        if item.get("status") == "active"
+    ]
+
+    def sort_key(entry: tuple[str, dict]) -> int:
+        try:
+            return int(entry[0])
+        except (TypeError, ValueError):
+            return -1
+
+    active_items.sort(key=sort_key, reverse=True)
+    embed = discord.Embed(
+        title="受付中のグッズ譲渡",
+        color=discord.Color.green(),
+    )
+    if not active_items:
+        embed.description = "現在、受付中のグッズはありません。"
+        return embed
+
+    for goods_id, item in active_items[:GOODS_LIST_MAX_ITEMS]:
+        lines = [
+            f"金額: {format_goods_price(item.get('price'))}",
+            f"希望者: {len(item.get('applicants', {}))}人",
+        ]
+        deadline = str(item.get("deadline", "")).strip()
+        lines.append(
+            f"募集期限: {format_event_datetime(deadline) if deadline else '期限なし'}"
+        )
+
+        if guild_id is not None:
+            try:
+                thread_id = int(item.get("post_thread_id"))
+                message_id = int(item.get("message_id"))
+            except (TypeError, ValueError):
+                pass
+            else:
+                url = (
+                    "https://discord.com/channels/"
+                    f"{guild_id}/{thread_id}/{message_id}"
+                )
+                lines.append(f"[募集を開く]({url})")
+
+        embed.add_field(
+            name=f"No.{goods_id} {item.get('name', 'グッズ')}"[:256],
+            value="\n".join(lines),
+            inline=False,
+        )
+
+    remaining = len(active_items) - GOODS_LIST_MAX_ITEMS
+    if remaining > 0:
+        embed.set_footer(text=f"ほか{remaining}件の受付中グッズがあります。")
     return embed
 
 
@@ -750,6 +994,141 @@ async def handle_event_participation(
     await interaction.response.send_message(message, ephemeral=True)
 
 
+class GoodsInterestView(discord.ui.View):
+    def __init__(self, disabled: bool = False):
+        super().__init__(timeout=None)
+        if disabled:
+            for item in self.children:
+                if isinstance(item, discord.ui.Button):
+                    item.disabled = True
+
+    @discord.ui.button(
+        label="欲しい",
+        style=discord.ButtonStyle.success,
+        custom_id="asari_manager:goods:interest",
+    )
+    async def register_interest(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await handle_goods_interest(interaction, register=True)
+
+    @discord.ui.button(
+        label="希望を取り消す",
+        style=discord.ButtonStyle.danger,
+        custom_id="asari_manager:goods:withdraw",
+    )
+    async def withdraw_interest(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await handle_goods_interest(interaction, register=False)
+
+
+async def handle_goods_interest(
+    interaction: discord.Interaction,
+    register: bool,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    user = interaction.user
+    if user.bot:
+        await interaction.followup.send(
+            "Botはグッズの譲渡希望を登録できません。",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.message is None:
+        await interaction.followup.send(
+            "グッズの募集メッセージを確認できませんでした。",
+            ephemeral=True,
+        )
+        return
+
+    async with GOODS_DATA_LOCK:
+        data = load_goods_data()
+        goods_id, item = find_goods_by_context(
+            data,
+            message_id=interaction.message.id,
+            channel_id=interaction.channel_id,
+        )
+        if goods_id is None or item is None:
+            await interaction.followup.send(
+                "このグッズの募集情報が見つかりませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        if item.get("status") != "active":
+            await interaction.followup.send(
+                "このグッズの募集受付は終了しています。",
+                ephemeral=True,
+            )
+            return
+
+        deadline_text = str(item.get("deadline", "")).strip()
+        if deadline_text:
+            try:
+                deadline = datetime.fromisoformat(deadline_text).astimezone(JST)
+            except ValueError:
+                deadline = None
+            if register and deadline is not None and now_jst() > deadline:
+                await interaction.followup.send(
+                    "このグッズの募集期限は過ぎています。",
+                    ephemeral=True,
+                )
+                return
+
+        user_id = str(user.id)
+        if register and user_id == str(item.get("creator_id")):
+            await interaction.followup.send(
+                "自分が登録したグッズには譲渡希望を出せません。",
+                ephemeral=True,
+            )
+            return
+
+        applicants = item.setdefault("applicants", {})
+        if not isinstance(applicants, dict):
+            applicants = {}
+            item["applicants"] = applicants
+
+        if register:
+            if user_id in applicants:
+                await interaction.followup.send(
+                    "このグッズには既に譲渡希望を登録しています。",
+                    ephemeral=True,
+                )
+                return
+            applicants[user_id] = {
+                "name": user.display_name,
+                "joined_at": now_jst().isoformat(),
+            }
+            response_text = "譲渡希望を受け付けました。"
+        else:
+            if user_id not in applicants:
+                await interaction.followup.send(
+                    "このグッズには譲渡希望を登録していません。",
+                    ephemeral=True,
+                )
+                return
+            applicants.pop(user_id)
+            response_text = "譲渡希望を取り消しました。"
+
+        save_goods_data(data)
+        try:
+            await interaction.message.edit(
+                embed=build_goods_embed(goods_id, item),
+                view=GoodsInterestView(),
+            )
+        except discord.HTTPException:
+            response_text += " ただし、募集表示の更新に失敗しました。"
+
+    await interaction.followup.send(response_text, ephemeral=True)
+
+
 class AsariManager(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -760,6 +1139,7 @@ class AsariManager(discord.Client):
         guild = discord.Object(id=SERVER_ID)
         self.add_view(AttendanceView())
         self.add_view(EventParticipationView())
+        self.add_view(GoodsInterestView())
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         post_daily_attendance_button.start()
@@ -767,6 +1147,7 @@ class AsariManager(discord.Client):
         # The daily 10:00 attendance report is intentionally not scheduled.
         announce_weekly_attendance_ranking.start()
         announce_event_starts.start()
+        expire_goods_offers.start()
 
 
 client = AsariManager()
@@ -1012,6 +1393,198 @@ def has_developer_role(interaction: discord.Interaction) -> bool:
         return False
 
     return any(role.id == DEVELOPER_ROLE_ID for role in user.roles)
+
+
+def can_manage_goods(interaction: discord.Interaction, item: dict) -> bool:
+    return (
+        str(interaction.user.id) == str(item.get("creator_id"))
+        or has_developer_role(interaction)
+    )
+
+
+def find_goods_for_command(
+    data: dict,
+    interaction: discord.Interaction,
+    goods_id: str | None,
+) -> tuple[str | None, dict | None]:
+    if goods_id is not None and goods_id.strip():
+        key = goods_id.strip()
+        return key, data["items"].get(key)
+    return find_goods_by_context(data, channel_id=interaction.channel_id)
+
+
+async def get_goods_category(
+    guild: discord.Guild,
+) -> discord.CategoryChannel | None:
+    category = guild.get_channel(GOODS_CATEGORY_ID)
+    if category is None:
+        try:
+            category = await client.fetch_channel(GOODS_CATEGORY_ID)
+        except discord.DiscordException:
+            return None
+    if isinstance(category, discord.CategoryChannel):
+        return category
+    return None
+
+
+async def fetch_goods_forum(item: dict) -> discord.ForumChannel | None:
+    try:
+        forum_id = int(item.get("forum_channel_id"))
+    except (TypeError, ValueError):
+        return None
+
+    forum = client.get_channel(forum_id)
+    if forum is None:
+        try:
+            forum = await client.fetch_channel(forum_id)
+        except discord.DiscordException:
+            return None
+    if isinstance(forum, discord.ForumChannel):
+        return forum
+    return None
+
+
+async def fetch_goods_thread(item: dict) -> discord.Thread | None:
+    try:
+        thread_id = int(item.get("post_thread_id"))
+    except (TypeError, ValueError):
+        return None
+
+    thread = client.get_channel(thread_id)
+    if thread is None:
+        try:
+            thread = await client.fetch_channel(thread_id)
+        except discord.DiscordException:
+            return None
+    if isinstance(thread, discord.Thread):
+        return thread
+    return None
+
+
+async def fetch_goods_message(item: dict) -> discord.Message | None:
+    thread = await fetch_goods_thread(item)
+    if thread is None:
+        return None
+
+    try:
+        message_id = int(item.get("message_id"))
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        return await thread.fetch_message(message_id)
+    except discord.DiscordException:
+        return None
+
+
+async def manageable_goods_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    data = load_goods_data()
+    current_lower = current.strip().lower()
+    developer = has_developer_role(interaction)
+
+    def sort_key(entry: tuple[str, dict]) -> int:
+        try:
+            return int(entry[0])
+        except (TypeError, ValueError):
+            return -1
+
+    choices = []
+    for goods_id, item in sorted(
+        data["items"].items(),
+        key=sort_key,
+        reverse=True,
+    ):
+        if item.get("status") in {"completed", "cancelled", "expired"}:
+            continue
+        if not developer and str(item.get("creator_id")) != str(interaction.user.id):
+            continue
+        label = (
+            f"No.{goods_id} [{goods_status_label(item)}] "
+            f"{item.get('name', 'グッズ')}"
+        )
+        if current_lower and current_lower not in label.lower():
+            continue
+        choices.append(
+            app_commands.Choice(name=label[:100], value=str(goods_id))
+        )
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+@tasks.loop(minutes=1)
+async def expire_goods_offers():
+    current = now_jst()
+    expired_items = []
+
+    async with GOODS_DATA_LOCK:
+        data = load_goods_data()
+        changed = False
+        for goods_id, item in data["items"].items():
+            if item.get("status") != "active":
+                continue
+            deadline_text = str(item.get("deadline", "")).strip()
+            if not deadline_text:
+                continue
+            try:
+                deadline = datetime.fromisoformat(deadline_text).astimezone(JST)
+            except ValueError:
+                continue
+            if deadline >= current:
+                continue
+
+            item["status"] = "expired"
+            item["expired_at"] = current.isoformat()
+            expired_items.append((str(goods_id), dict(item)))
+            changed = True
+
+        if changed:
+            save_goods_data(data)
+
+    for goods_id, item in expired_items:
+        message = await fetch_goods_message(item)
+        if message is not None:
+            try:
+                await message.edit(
+                    embed=build_goods_embed(goods_id, item),
+                    view=GoodsInterestView(disabled=True),
+                )
+            except discord.HTTPException:
+                pass
+
+        forum = await fetch_goods_forum(item)
+        if forum is not None:
+            try:
+                await forum.edit(
+                    name=normalize_goods_channel_name(
+                        goods_id,
+                        str(item.get("name", "グッズ")),
+                        "expired",
+                    ),
+                    reason=f"Goods No.{goods_id} expired",
+                )
+            except discord.HTTPException:
+                pass
+
+        thread = await fetch_goods_thread(item)
+        if thread is not None:
+            try:
+                await thread.send("募集期限を過ぎたため、このグッズ譲渡募集を終了します。")
+                await thread.edit(
+                    locked=True,
+                    archived=True,
+                    reason=f"Goods No.{goods_id} expired",
+                )
+            except discord.HTTPException:
+                pass
+
+
+@expire_goods_offers.before_loop
+async def before_expire_goods_offers():
+    await client.wait_until_ready()
 
 
 async def fetch_event_message(
@@ -1921,6 +2494,772 @@ async def event_cancel(
     if not notification_sent:
         response_text += " ただし、イベント企画チャンネルへの削除通知に失敗しました。"
     await interaction.followup.send(response_text, ephemeral=True)
+
+
+@client.tree.command(
+    name="goods_list",
+    description="受付中のグッズ譲渡募集を一覧表示します",
+)
+async def goods_list(interaction: discord.Interaction):
+    data = load_goods_data()
+    embed = build_goods_list_embed(data, interaction.guild_id)
+    await interaction.response.send_message(embed=embed)
+
+
+@client.tree.command(
+    name="goods_offer",
+    description="goodsカテゴリにグッズ譲渡用フォーラムを作成します",
+)
+@app_commands.describe(
+    name="グッズ名",
+    photo="グッズの写真",
+    price="金額。未指定または0は無料",
+    condition="グッズの状態",
+    quantity="個数。未指定は1個",
+    deadline="募集期限 例: 2026-08-01 23:59",
+    description="説明や注意事項",
+)
+async def goods_offer(
+    interaction: discord.Interaction,
+    name: str,
+    photo: discord.Attachment,
+    price: int | None = None,
+    condition: str | None = None,
+    quantity: int = 1,
+    deadline: str | None = None,
+    description: str | None = None,
+):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send(
+            "サーバー内で実行してください。",
+            ephemeral=True,
+        )
+        return
+
+    cleaned_name = " ".join(name.strip().split())
+    if not cleaned_name or len(cleaned_name) > 200:
+        await interaction.followup.send(
+            "グッズ名は1文字以上200文字以内で指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    if price is not None and not 0 <= price <= 100_000_000:
+        await interaction.followup.send(
+            "金額は0円から100,000,000円の範囲で指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    if not 1 <= quantity <= 1000:
+        await interaction.followup.send(
+            "個数は1個から1000個の範囲で指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    if condition is not None and len(condition) > 1000:
+        await interaction.followup.send(
+            "状態は1000文字以内で入力してください。",
+            ephemeral=True,
+        )
+        return
+
+    if description is not None and len(description) > 1000:
+        await interaction.followup.send(
+            "説明は1000文字以内で入力してください。",
+            ephemeral=True,
+        )
+        return
+
+    if photo.content_type and not photo.content_type.startswith("image/"):
+        await interaction.followup.send(
+            "写真には画像ファイルを指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    parsed_deadline = None
+    if deadline is not None and deadline.strip():
+        parsed_deadline = parse_event_datetime(deadline.strip())
+        if parsed_deadline is None:
+            await interaction.followup.send(
+                "募集期限は `2026-08-01 23:59` または `2026/08/01 23:59` の形式で入力してください。",
+                ephemeral=True,
+            )
+            return
+        if parsed_deadline <= now_jst():
+            await interaction.followup.send(
+                "募集期限は現在より後の日時にしてください。",
+                ephemeral=True,
+            )
+            return
+
+    goods_category = await get_goods_category(guild)
+    if goods_category is None:
+        await interaction.followup.send(
+            "`GOODS_CATEGORY_ID` のカテゴリが見つかりませんでした。",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        image_file = await photo.to_file(use_cached=True)
+    except (discord.DiscordException, OSError) as error:
+        await interaction.followup.send(
+            f"写真を取得できませんでした。\n{code_block(str(error))}",
+            ephemeral=True,
+        )
+        return
+
+    async with GOODS_DATA_LOCK:
+        data = load_goods_data()
+        goods_id = str(data["next_id"])
+        data["next_id"] = int(data["next_id"]) + 1
+        save_goods_data(data)
+
+    item = {
+        "name": cleaned_name,
+        "description": description.strip() if description else "",
+        "condition": condition.strip() if condition else "",
+        "price": price,
+        "quantity": quantity,
+        "creator_id": str(interaction.user.id),
+        "created_at": now_jst().isoformat(),
+        "deadline": parsed_deadline.isoformat() if parsed_deadline else "",
+        "status": "active",
+        "forum_channel_id": None,
+        "post_thread_id": None,
+        "message_id": None,
+        "image_url": "",
+        "applicants": {},
+        "recipient_id": None,
+    }
+    forum = None
+    try:
+        forum = await guild.create_forum(
+            name=normalize_goods_channel_name(goods_id, cleaned_name),
+            category=goods_category,
+            reason=f"Created by /goods_offer for {interaction.user}",
+        )
+
+        initial_embed = build_goods_embed(goods_id, item)
+        initial_embed.set_image(url=f"attachment://{image_file.filename}")
+        created = await forum.create_thread(
+            name=build_goods_post_name(cleaned_name),
+            embed=initial_embed,
+            file=image_file,
+            view=GoodsInterestView(),
+            reason=f"Goods No.{goods_id} created by {interaction.user}",
+        )
+    except discord.Forbidden:
+        if forum is not None:
+            try:
+                await forum.delete(reason="Rolling back failed goods creation")
+            except discord.DiscordException:
+                pass
+        await interaction.followup.send(
+            "フォーラムまたは募集投稿を作成する権限がありません。Botのチャンネル管理・投稿・ファイル添付権限を確認してください。",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as error:
+        if forum is not None:
+            try:
+                await forum.delete(reason="Rolling back failed goods creation")
+            except discord.DiscordException:
+                pass
+        await interaction.followup.send(
+            f"グッズ譲渡フォーラムの作成に失敗しました。\n{code_block(str(error))}",
+            ephemeral=True,
+        )
+        return
+
+    thread = created.thread
+    message = created.message
+    item["forum_channel_id"] = forum.id
+    item["post_thread_id"] = thread.id
+    item["message_id"] = message.id
+    if message.attachments:
+        item["image_url"] = message.attachments[0].url
+
+    async with GOODS_DATA_LOCK:
+        data = load_goods_data()
+        data["items"][goods_id] = item
+        save_goods_data(data)
+
+    try:
+        await message.edit(
+            embed=build_goods_embed(goods_id, item),
+            view=GoodsInterestView(),
+        )
+    except discord.HTTPException:
+        pass
+
+    await interaction.followup.send(
+        f"グッズNo.{goods_id}の譲渡フォーラムを作成しました。\n{message.jump_url}",
+        ephemeral=True,
+    )
+
+
+@client.tree.command(
+    name="goods_applicants",
+    description="自分のグッズ譲渡募集の希望者を確認します",
+)
+@app_commands.describe(
+    goods_id="グッズ番号。募集投稿内では省略できます",
+)
+@app_commands.autocomplete(goods_id=manageable_goods_autocomplete)
+async def goods_applicants(
+    interaction: discord.Interaction,
+    goods_id: str | None = None,
+):
+    data = load_goods_data()
+    goods_key, item = find_goods_for_command(data, interaction, goods_id)
+    if goods_key is None or item is None:
+        await interaction.response.send_message(
+            "対象のグッズが見つかりません。募集投稿内で実行するか、グッズ番号を指定してください。",
+            ephemeral=True,
+        )
+        return
+    if not can_manage_goods(interaction, item):
+        await interaction.response.send_message(
+            "希望者を確認できるのは譲渡者本人またはdeveloperだけです。",
+            ephemeral=True,
+        )
+        return
+
+    applicants = item.get("applicants", {})
+    if not isinstance(applicants, dict) or not applicants:
+        body = "希望者はまだいません。"
+    else:
+        sorted_applicants = sorted(
+            applicants.items(),
+            key=lambda entry: str(entry[1].get("joined_at", "")),
+        )
+        lines = [
+            f"{index}. <@{user_id}>"
+            for index, (user_id, _record) in enumerate(
+                sorted_applicants[:40],
+                start=1,
+            )
+        ]
+        if len(sorted_applicants) > 40:
+            lines.append(f"ほか{len(sorted_applicants) - 40}人")
+        body = "\n".join(lines)
+
+    await interaction.response.send_message(
+        f"グッズNo.{goods_key}「{item.get('name', 'グッズ')}」の希望者です。\n{body}",
+        ephemeral=True,
+    )
+
+
+@client.tree.command(
+    name="goods_select",
+    description="グッズの譲渡先を希望者から決定します",
+)
+@app_commands.describe(
+    recipient="譲渡先に決定するメンバー",
+    goods_id="グッズ番号。募集投稿内では省略できます",
+)
+@app_commands.autocomplete(goods_id=manageable_goods_autocomplete)
+async def goods_select(
+    interaction: discord.Interaction,
+    recipient: discord.Member,
+    goods_id: str | None = None,
+):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    async with GOODS_DATA_LOCK:
+        data = load_goods_data()
+        goods_key, item = find_goods_for_command(data, interaction, goods_id)
+        if goods_key is None or item is None:
+            await interaction.followup.send(
+                "対象のグッズが見つかりません。募集投稿内で実行するか、グッズ番号を指定してください。",
+                ephemeral=True,
+            )
+            return
+        if not can_manage_goods(interaction, item):
+            await interaction.followup.send(
+                "譲渡先を決定できるのは譲渡者本人またはdeveloperだけです。",
+                ephemeral=True,
+            )
+            return
+        if item.get("status") != "active":
+            await interaction.followup.send(
+                "受付中のグッズだけ譲渡先を決定できます。",
+                ephemeral=True,
+            )
+            return
+        if recipient.bot:
+            await interaction.followup.send(
+                "Botを譲渡先には指定できません。",
+                ephemeral=True,
+            )
+            return
+        applicants = item.get("applicants", {})
+        if str(recipient.id) not in applicants:
+            await interaction.followup.send(
+                "指定したメンバーはこのグッズの譲渡希望者ではありません。",
+                ephemeral=True,
+            )
+            return
+
+        item["status"] = "reserved"
+        item["recipient_id"] = str(recipient.id)
+        item["selected_by"] = str(interaction.user.id)
+        item["selected_at"] = now_jst().isoformat()
+        save_goods_data(data)
+
+    warnings = []
+    message = await fetch_goods_message(item)
+    if message is None:
+        warnings.append("募集メッセージを更新できませんでした")
+    else:
+        try:
+            await message.edit(
+                embed=build_goods_embed(goods_key, item),
+                view=GoodsInterestView(disabled=True),
+            )
+        except discord.HTTPException:
+            warnings.append("募集メッセージを更新できませんでした")
+
+    forum = await fetch_goods_forum(item)
+    if forum is None:
+        warnings.append("フォーラム名を変更できませんでした")
+    else:
+        try:
+            await forum.edit(
+                name=normalize_goods_channel_name(
+                    goods_key,
+                    str(item.get("name", "グッズ")),
+                    "reserved",
+                ),
+                reason=f"Goods No.{goods_key} recipient selected",
+            )
+        except discord.HTTPException:
+            warnings.append("フォーラム名を変更できませんでした")
+
+    thread = await fetch_goods_thread(item)
+    if thread is None:
+        warnings.append("譲渡先決定を投稿できませんでした")
+    else:
+        try:
+            await thread.send(
+                f"譲渡先が {recipient.mention} に決定しました。今後の受け渡し方法は当事者間で相談してください。",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    users=[recipient],
+                    roles=False,
+                ),
+            )
+        except discord.HTTPException:
+            warnings.append("譲渡先決定を投稿できませんでした")
+
+    response = f"グッズNo.{goods_key}の譲渡先を{recipient.mention}に決定しました。"
+    if warnings:
+        response += "\n注意: " + "、".join(dict.fromkeys(warnings))
+    await interaction.followup.send(response, ephemeral=True)
+
+
+@client.tree.command(
+    name="goods_edit",
+    description="受付中のグッズ譲渡募集を編集します",
+)
+@app_commands.describe(
+    goods_id="グッズ番号。募集投稿内では省略できます",
+    name="新しいグッズ名",
+    photo="新しい写真",
+    price="新しい金額。0は無料",
+    condition="新しい状態。削除は -",
+    quantity="新しい個数",
+    deadline="新しい募集期限。削除は -",
+    description="新しい説明。削除は -",
+)
+@app_commands.autocomplete(goods_id=manageable_goods_autocomplete)
+async def goods_edit(
+    interaction: discord.Interaction,
+    goods_id: str | None = None,
+    name: str | None = None,
+    photo: discord.Attachment | None = None,
+    price: int | None = None,
+    condition: str | None = None,
+    quantity: int | None = None,
+    deadline: str | None = None,
+    description: str | None = None,
+):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    updates = {}
+    if name is not None:
+        cleaned_name = " ".join(name.strip().split())
+        if not cleaned_name or len(cleaned_name) > 200:
+            await interaction.followup.send(
+                "グッズ名は1文字以上200文字以内で指定してください。",
+                ephemeral=True,
+            )
+            return
+        updates["name"] = cleaned_name
+    if price is not None:
+        if not 0 <= price <= 100_000_000:
+            await interaction.followup.send(
+                "金額は0円から100,000,000円の範囲で指定してください。",
+                ephemeral=True,
+            )
+            return
+        updates["price"] = price
+    if quantity is not None:
+        if not 1 <= quantity <= 1000:
+            await interaction.followup.send(
+                "個数は1個から1000個の範囲で指定してください。",
+                ephemeral=True,
+            )
+            return
+        updates["quantity"] = quantity
+    if condition is not None:
+        if len(condition) > 1000:
+            await interaction.followup.send(
+                "状態は1000文字以内で入力してください。",
+                ephemeral=True,
+            )
+            return
+        updates["condition"] = normalize_optional_event_value(condition)
+    if description is not None:
+        if len(description) > 1000:
+            await interaction.followup.send(
+                "説明は1000文字以内で入力してください。",
+                ephemeral=True,
+            )
+            return
+        updates["description"] = normalize_optional_event_value(description)
+    if deadline is not None:
+        normalized_deadline = normalize_optional_event_value(deadline)
+        if normalized_deadline:
+            parsed_deadline = parse_event_datetime(normalized_deadline)
+            if parsed_deadline is None:
+                await interaction.followup.send(
+                    "募集期限は `2026-08-01 23:59` または `2026/08/01 23:59` の形式で入力してください。",
+                    ephemeral=True,
+                )
+                return
+            if parsed_deadline <= now_jst():
+                await interaction.followup.send(
+                    "募集期限は現在より後の日時にしてください。",
+                    ephemeral=True,
+                )
+                return
+            updates["deadline"] = parsed_deadline.isoformat()
+        else:
+            updates["deadline"] = ""
+    if photo is not None and photo.content_type and not photo.content_type.startswith("image/"):
+        await interaction.followup.send(
+            "写真には画像ファイルを指定してください。",
+            ephemeral=True,
+        )
+        return
+    if not updates and photo is None:
+        await interaction.followup.send(
+            "変更する項目を1つ以上指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    image_file = None
+    if photo is not None:
+        try:
+            image_file = await photo.to_file(use_cached=True)
+        except (discord.DiscordException, OSError) as error:
+            await interaction.followup.send(
+                f"写真を取得できませんでした。\n{code_block(str(error))}",
+                ephemeral=True,
+            )
+            return
+
+    async with GOODS_DATA_LOCK:
+        data = load_goods_data()
+        goods_key, item = find_goods_for_command(data, interaction, goods_id)
+        if goods_key is None or item is None:
+            await interaction.followup.send(
+                "対象のグッズが見つかりません。募集投稿内で実行するか、グッズ番号を指定してください。",
+                ephemeral=True,
+            )
+            return
+        if not can_manage_goods(interaction, item):
+            await interaction.followup.send(
+                "編集できるのは譲渡者本人またはdeveloperだけです。",
+                ephemeral=True,
+            )
+            return
+        if item.get("status") != "active":
+            await interaction.followup.send(
+                "受付中のグッズだけ編集できます。",
+                ephemeral=True,
+            )
+            return
+
+        updated_item = dict(item)
+        updated_item.update(updates)
+        updated_item["updated_by"] = str(interaction.user.id)
+        updated_item["updated_at"] = now_jst().isoformat()
+
+        message = await fetch_goods_message(item)
+        if message is None:
+            await interaction.followup.send(
+                "募集メッセージが見つからないため編集できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            if image_file is None:
+                edited_message = await message.edit(
+                    embed=build_goods_embed(goods_key, updated_item),
+                    view=GoodsInterestView(),
+                )
+            else:
+                updated_embed = build_goods_embed(goods_key, updated_item)
+                updated_embed.set_image(url=f"attachment://{image_file.filename}")
+                edited_message = await message.edit(
+                    embed=updated_embed,
+                    attachments=[image_file],
+                    view=GoodsInterestView(),
+                )
+                if edited_message.attachments:
+                    updated_item["image_url"] = edited_message.attachments[0].url
+                    try:
+                        await edited_message.edit(
+                            embed=build_goods_embed(goods_key, updated_item),
+                            view=GoodsInterestView(),
+                        )
+                    except discord.HTTPException:
+                        pass
+        except discord.HTTPException as error:
+            await interaction.followup.send(
+                f"募集メッセージの編集に失敗しました。\n{code_block(str(error))}",
+                ephemeral=True,
+            )
+            return
+
+        data["items"][goods_key] = updated_item
+        save_goods_data(data)
+        item = updated_item
+
+    warning = ""
+    if "name" in updates:
+        forum = await fetch_goods_forum(item)
+        if forum is None:
+            warning = " ただし、フォーラム名を変更できませんでした。"
+        else:
+            try:
+                await forum.edit(
+                    name=normalize_goods_channel_name(
+                        goods_key,
+                        str(item.get("name", "グッズ")),
+                    ),
+                    reason=f"Goods No.{goods_key} edited",
+                )
+            except discord.HTTPException:
+                warning = " ただし、フォーラム名を変更できませんでした。"
+
+    await interaction.followup.send(
+        f"グッズNo.{goods_key}の募集内容を編集しました。{warning}",
+        ephemeral=True,
+    )
+
+
+@client.tree.command(
+    name="goods_complete",
+    description="グッズの受け渡し完了を記録します",
+)
+@app_commands.describe(
+    goods_id="グッズ番号。募集投稿内では省略できます",
+)
+@app_commands.autocomplete(goods_id=manageable_goods_autocomplete)
+async def goods_complete(
+    interaction: discord.Interaction,
+    goods_id: str | None = None,
+):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    async with GOODS_DATA_LOCK:
+        data = load_goods_data()
+        goods_key, item = find_goods_for_command(data, interaction, goods_id)
+        if goods_key is None or item is None:
+            await interaction.followup.send(
+                "対象のグッズが見つかりません。募集投稿内で実行するか、グッズ番号を指定してください。",
+                ephemeral=True,
+            )
+            return
+        if not can_manage_goods(interaction, item):
+            await interaction.followup.send(
+                "完了にできるのは譲渡者本人またはdeveloperだけです。",
+                ephemeral=True,
+            )
+            return
+        if item.get("status") != "reserved":
+            await interaction.followup.send(
+                "譲渡先決定済みのグッズだけ完了にできます。",
+                ephemeral=True,
+            )
+            return
+        item["status"] = "completed"
+        item["completed_by"] = str(interaction.user.id)
+        item["completed_at"] = now_jst().isoformat()
+        save_goods_data(data)
+
+    warnings = []
+    message = await fetch_goods_message(item)
+    if message is None:
+        warnings.append("募集メッセージを更新できませんでした")
+    else:
+        try:
+            await message.edit(
+                embed=build_goods_embed(goods_key, item),
+                view=GoodsInterestView(disabled=True),
+            )
+        except discord.HTTPException:
+            warnings.append("募集メッセージを更新できませんでした")
+
+    forum = await fetch_goods_forum(item)
+    if forum is None:
+        warnings.append("フォーラム名を変更できませんでした")
+    else:
+        try:
+            await forum.edit(
+                name=normalize_goods_channel_name(
+                    goods_key,
+                    str(item.get("name", "グッズ")),
+                    "completed",
+                ),
+                reason=f"Goods No.{goods_key} completed",
+            )
+        except discord.HTTPException:
+            warnings.append("フォーラム名を変更できませんでした")
+
+    thread = await fetch_goods_thread(item)
+    if thread is None:
+        warnings.append("募集投稿を終了できませんでした")
+    else:
+        try:
+            await thread.send("グッズの受け渡しが完了しました。この投稿を終了します。")
+            await thread.edit(
+                locked=True,
+                archived=True,
+                reason=f"Goods No.{goods_key} completed",
+            )
+        except discord.HTTPException:
+            warnings.append("募集投稿を終了できませんでした")
+
+    response = f"グッズNo.{goods_key}を譲渡完了にしました。"
+    if warnings:
+        response += "\n注意: " + "、".join(dict.fromkeys(warnings))
+    await interaction.followup.send(response, ephemeral=True)
+
+
+@client.tree.command(
+    name="goods_cancel",
+    description="グッズ譲渡募集を取り消します",
+)
+@app_commands.describe(
+    goods_id="グッズ番号。募集投稿内では省略できます",
+    reason="取り消し理由",
+)
+@app_commands.autocomplete(goods_id=manageable_goods_autocomplete)
+async def goods_cancel(
+    interaction: discord.Interaction,
+    goods_id: str | None = None,
+    reason: str | None = None,
+):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    if reason is not None and len(reason) > 1000:
+        await interaction.followup.send(
+            "取り消し理由は1000文字以内で入力してください。",
+            ephemeral=True,
+        )
+        return
+
+    async with GOODS_DATA_LOCK:
+        data = load_goods_data()
+        goods_key, item = find_goods_for_command(data, interaction, goods_id)
+        if goods_key is None or item is None:
+            await interaction.followup.send(
+                "対象のグッズが見つかりません。募集投稿内で実行するか、グッズ番号を指定してください。",
+                ephemeral=True,
+            )
+            return
+        if not can_manage_goods(interaction, item):
+            await interaction.followup.send(
+                "取り消せるのは譲渡者本人またはdeveloperだけです。",
+                ephemeral=True,
+            )
+            return
+        if item.get("status") in {"completed", "cancelled", "expired"}:
+            await interaction.followup.send(
+                "このグッズの募集は既に終了しています。",
+                ephemeral=True,
+            )
+            return
+        item["status"] = "cancelled"
+        item["cancellation_reason"] = reason.strip() if reason else ""
+        item["cancelled_by"] = str(interaction.user.id)
+        item["cancelled_at"] = now_jst().isoformat()
+        save_goods_data(data)
+
+    warnings = []
+    message = await fetch_goods_message(item)
+    if message is None:
+        warnings.append("募集メッセージを更新できませんでした")
+    else:
+        try:
+            await message.edit(
+                embed=build_goods_embed(goods_key, item),
+                view=GoodsInterestView(disabled=True),
+            )
+        except discord.HTTPException:
+            warnings.append("募集メッセージを更新できませんでした")
+
+    forum = await fetch_goods_forum(item)
+    if forum is None:
+        warnings.append("フォーラム名を変更できませんでした")
+    else:
+        try:
+            await forum.edit(
+                name=normalize_goods_channel_name(
+                    goods_key,
+                    str(item.get("name", "グッズ")),
+                    "cancelled",
+                ),
+                reason=f"Goods No.{goods_key} cancelled",
+            )
+        except discord.HTTPException:
+            warnings.append("フォーラム名を変更できませんでした")
+
+    thread = await fetch_goods_thread(item)
+    if thread is None:
+        warnings.append("募集投稿を終了できませんでした")
+    else:
+        reason_text = str(item.get("cancellation_reason", "")).strip()
+        notice = "このグッズ譲渡募集は取り消されました。"
+        if reason_text:
+            notice += f"\n理由: {reason_text}"
+        try:
+            await thread.send(notice)
+            await thread.edit(
+                locked=True,
+                archived=True,
+                reason=f"Goods No.{goods_key} cancelled",
+            )
+        except discord.HTTPException:
+            warnings.append("募集投稿を終了できませんでした")
+
+    response = f"グッズNo.{goods_key}の募集を取り消しました。"
+    if warnings:
+        response += "\n注意: " + "、".join(dict.fromkeys(warnings))
+    await interaction.followup.send(response, ephemeral=True)
 
 
 @client.tree.command(name="checkbot", description="Botのsystemdステータスを確認します")
